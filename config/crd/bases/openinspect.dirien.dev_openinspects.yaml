@@ -161,6 +161,9 @@ spec:
                         - name
                         type: object
                       apiUrl:
+                        description: |-
+                          APIURL of the Daytona API (e.g. https://app.daytona.io/api); the
+                          upstream control plane requires it.
                         type: string
                       baseSnapshot:
                         description: |-
@@ -171,6 +174,7 @@ spec:
                         type: string
                     required:
                     - apiKeySecretRef
+                    - apiUrl
                     - baseSnapshot
                     type: object
                   inactivityTimeoutMs:
@@ -237,6 +241,20 @@ spec:
                     description: OpenComputerSandboxSpec configures the OpenComputer
                       sandbox provider.
                     properties:
+                      anthropicApiKeySecretRef:
+                        description: |-
+                          AnthropicAPIKeySecretRef is passed into sandboxes as ANTHROPIC_API_KEY
+                          so the agent can call the model (upstream requires it for this
+                          provider).
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
                       apiKeySecretRef:
                         description: SecretKeyRef selects a key of a Secret in the
                           same namespace.

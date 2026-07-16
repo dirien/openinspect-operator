@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"maps"
 	"strconv"
 
 	openinspectv1alpha1 "github.com/dirien/openinspect-operator/api/v1alpha1"
@@ -56,6 +57,9 @@ func sandboxInjection(sb *openinspectv1alpha1.SandboxSpec) (vars map[string]stri
 		set("OPENCOMPUTER_API_URL", o.APIURL)
 		set("OPENCOMPUTER_TEMPLATE", o.Template)
 		sec("OPENCOMPUTER_API_KEY", o.APIKeySecretRef)
+		if o.AnthropicAPIKeySecretRef != nil {
+			sec("ANTHROPIC_API_KEY", *o.AnthropicAPIKeySecretRef)
+		}
 	}
 	return vars, secrets
 }
@@ -77,24 +81,30 @@ func applySandbox(oi *openinspectv1alpha1.OpenInspect, w openinspectv1alpha1.Wor
 
 	vars, secrets := sandboxInjection(sb)
 
+	// Cloudflare binding names share one namespace across kinds, so explicit
+	// worker values suppress injected ones by NAME, var or secret alike.
+	explicit := map[string]bool{}
+	for k := range w.Vars {
+		explicit[k] = true
+	}
+	for _, s := range w.Secrets {
+		explicit[s.Binding] = true
+	}
+
 	merged := map[string]string{}
 	for k, v := range vars {
-		merged[k] = v
+		if !explicit[k] {
+			merged[k] = v
+		}
 	}
-	for k, v := range w.Vars {
-		merged[k] = v
-	}
+	maps.Copy(merged, w.Vars)
 	w.Vars = merged
 
-	have := map[string]bool{}
-	for _, s := range w.Secrets {
-		have[s.Binding] = true
-	}
 	// w.Secrets came from a deepcopy of the CR; append must not alias it.
 	out := make([]openinspectv1alpha1.WorkerSecret, len(w.Secrets), len(w.Secrets)+len(secrets))
 	copy(out, w.Secrets)
 	for _, s := range secrets {
-		if !have[s.Binding] {
+		if !explicit[s.Binding] {
 			out = append(out, s)
 		}
 	}
@@ -128,8 +138,8 @@ func validateSandbox(sb *openinspectv1alpha1.SandboxSpec, workers map[string]boo
 	if !sections[sb.Provider].present {
 		return fmt.Errorf("sandbox.provider is %q but spec.sandbox.%s is not set", sb.Provider, sections[sb.Provider].field)
 	}
-	for name, s := range sections {
-		if s.present && name != sb.Provider {
+	for _, name := range []string{"modal", "daytona", "vercel", "opencomputer"} {
+		if s := sections[name]; s.present && name != sb.Provider {
 			return fmt.Errorf("sandbox.%s is set but provider is %q", s.field, sb.Provider)
 		}
 	}

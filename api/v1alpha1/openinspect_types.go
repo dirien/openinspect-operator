@@ -186,8 +186,9 @@ type DaytonaSandboxSpec struct {
 	// BaseSnapshot is the name of a prebuilt Daytona snapshot containing the
 	// sandbox runtime.
 	BaseSnapshot string `json:"baseSnapshot"`
-	// +optional
-	APIURL string `json:"apiUrl,omitempty"`
+	// APIURL of the Daytona API (e.g. https://app.daytona.io/api); the
+	// upstream control plane requires it.
+	APIURL string `json:"apiUrl"`
 	// +optional
 	Target string `json:"target,omitempty"`
 
@@ -224,6 +225,11 @@ type OpenComputerSandboxSpec struct {
 	Template string `json:"template"`
 
 	APIKeySecretRef SecretKeyRef `json:"apiKeySecretRef"`
+	// AnthropicAPIKeySecretRef is passed into sandboxes as ANTHROPIC_API_KEY
+	// so the agent can call the model (upstream requires it for this
+	// provider).
+	// +optional
+	AnthropicAPIKeySecretRef *SecretKeyRef `json:"anthropicApiKeySecretRef,omitempty"`
 }
 
 // SandboxSpec selects and configures exactly one sandbox provider. The

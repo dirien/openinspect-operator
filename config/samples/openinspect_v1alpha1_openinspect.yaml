@@ -76,6 +76,7 @@ spec:
       apiSecretSecretRef: {name: platform-secrets, key: modalApiSecret}
     # daytona:
     #   baseSnapshot: openinspect-base
+    #   apiUrl: https://app.daytona.io/api
     #   apiKeySecretRef: {name: platform-secrets, key: daytonaApiKey}
     # vercel:
     #   projectId: prj_xxx

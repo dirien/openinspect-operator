@@ -148,6 +148,42 @@ func TestApplySandboxUserValuesWin(t *testing.T) {
 	}
 }
 
+func TestApplySandboxCrossTypeCollision(t *testing.T) {
+	oi := &openinspectv1alpha1.OpenInspect{
+		Spec: openinspectv1alpha1.OpenInspectSpec{
+			Sandbox: &openinspectv1alpha1.SandboxSpec{
+				Provider: "modal",
+				Modal: &openinspectv1alpha1.ModalSandboxSpec{
+					Workspace:        "dirien",
+					TokenIDSecretRef: ref("id"), TokenSecretSecretRef: ref("tok"), APISecretSecretRef: ref("api"),
+				},
+			},
+		},
+	}
+	// Explicit VAR named like an injected SECRET, and explicit SECRET named
+	// like an injected VAR: Cloudflare binding names share one namespace, so
+	// both injections must be suppressed.
+	w := openinspectv1alpha1.WorkerSpec{
+		Name: "control-plane",
+		Vars: map[string]string{"MODAL_TOKEN_ID": "as-plain-var"},
+		Secrets: []openinspectv1alpha1.WorkerSecret{
+			{Binding: "SANDBOX_PROVIDER", SecretRef: ref("weird")},
+		},
+	}
+	got := applySandbox(oi, w)
+	for _, s := range got.Secrets {
+		if s.Binding == "MODAL_TOKEN_ID" {
+			t.Error("injected secret must be suppressed by explicit var of the same name")
+		}
+	}
+	if _, ok := got.Vars["SANDBOX_PROVIDER"]; ok {
+		t.Error("injected var must be suppressed by explicit secret of the same name")
+	}
+	if got.Vars["MODAL_TOKEN_ID"] != "as-plain-var" {
+		t.Error("explicit var must survive")
+	}
+}
+
 func TestValidateSandbox(t *testing.T) {
 	workers := map[string]bool{"control-plane": true}
 	if err := validateSandbox(&openinspectv1alpha1.SandboxSpec{Provider: "daytona"}, workers); err == nil {
