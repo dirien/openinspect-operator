@@ -339,6 +339,41 @@ var _ = Describe("OpenInspect Controller", func() {
 		Expect(oi.Status.R2Buckets).To(BeEmpty())
 	})
 
+	It("maps referenced ConfigMaps and Secrets back to the CR", func() {
+		oi := &openinspectv1alpha1.OpenInspect{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: openinspectv1alpha1.OpenInspectSpec{
+				DeploymentName: "mapper",
+				Cloudflare: openinspectv1alpha1.CloudflareSpec{
+					AccountID:         "acc-123",
+					APITokenSecretRef: openinspectv1alpha1.SecretKeyRef{Name: "cf-creds", Key: "apiToken"},
+					APIBaseURL:        mock.URL,
+				},
+				D1: &openinspectv1alpha1.D1Spec{MigrationsConfigMapRef: "d1-migrations"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, oi)).To(Succeed())
+		DeferCleanup(func() {
+			latest := &openinspectv1alpha1.OpenInspect{}
+			if err := k8sClient.Get(ctx, key, latest); err == nil {
+				latest.Finalizers = nil
+				_ = k8sClient.Update(ctx, latest)
+				_ = k8sClient.Delete(ctx, latest)
+			}
+		})
+
+		cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "d1-migrations", Namespace: ns}}
+		reqs := reconciler.mapReferencing(referencesConfigMap)(ctx, cm)
+		Expect(reqs).To(HaveLen(1))
+		Expect(reqs[0].Name).To(Equal(name))
+
+		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "cf-creds", Namespace: ns}}
+		Expect(reconciler.mapReferencing(referencesSecret)(ctx, secret)).To(HaveLen(1))
+
+		unrelated := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: ns}}
+		Expect(reconciler.mapReferencing(referencesConfigMap)(ctx, unrelated)).To(BeEmpty())
+	})
+
 	It("orphans Cloudflare resources with deletionPolicy Orphan", func() {
 		oi := &openinspectv1alpha1.OpenInspect{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},

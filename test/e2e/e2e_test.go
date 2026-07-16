@@ -362,6 +362,21 @@ var _ = Describe("Manager", Ordered, func() {
 			_, err = utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "web service should exist")
 
+			By("a ConfigMap edit rolls out via watch, well inside the 5m resync")
+			cmd = exec.Command("kubectl", "patch", "configmap", "d1-migrations", "-n", oiNamespace,
+				"--type", "merge", "-p",
+				`{"data":{"0003_watch_test.sql":"CREATE TABLE watch_test (id TEXT PRIMARY KEY);"}}`)
+			_, err = utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "openinspect", "e2e", "-n", oiNamespace,
+					"-o", "jsonpath={.status.appliedMigrations}")
+				out, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(Equal("3"))
+			}, 60*time.Second, 2*time.Second).Should(Succeed(),
+				"migration added to the ConfigMap must apply without touching the CR")
+
 			By("deleting the CR cleans up Cloudflare resources and the web UI")
 			cmd = exec.Command("kubectl", "delete", "openinspect", "e2e", "-n", oiNamespace, "--timeout=120s")
 			_, err = utils.Run(cmd)

@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
@@ -48,9 +49,10 @@ import (
 const (
 	finalizer = "openinspect.dirien.dev/finalizer"
 
-	// resyncInterval re-runs the idempotent ensure pass to pick up drift and
-	// changes in referenced ConfigMaps/Secrets (which are not watched).
-	resyncInterval = 5 * time.Minute
+	// defaultResyncInterval re-runs the idempotent ensure pass to correct
+	// drift. Referenced ConfigMap/Secret changes are picked up immediately by
+	// watches; this is only the drift-correction floor.
+	defaultResyncInterval = 5 * time.Minute
 	// pendingInterval retries quickly while service bindings wait for their
 	// target workers to exist.
 	pendingInterval = 15 * time.Second
@@ -64,8 +66,19 @@ type OpenInspectReconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
 
+	// ResyncInterval overrides how often a Ready object is re-reconciled for
+	// drift correction (--resync-interval flag); zero means the default.
+	ResyncInterval time.Duration
+
 	// NewCF is swappable in tests; defaults to cfclient.New.
 	NewCF func(accountID, apiToken, baseURL string) *cfclient.Client
+}
+
+func (r *OpenInspectReconciler) resyncInterval() time.Duration {
+	if r.ResyncInterval > 0 {
+		return r.ResyncInterval
+	}
+	return defaultResyncInterval
 }
 
 // +kubebuilder:rbac:groups=openinspect.dirien.dev,resources=openinspects,verbs=get;list;watch;create;update;patch;delete
@@ -127,7 +140,7 @@ func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.failed(ctx, oi, openinspectv1alpha1.ConditionWeb, "WebFailed", err)
 	}
 
-	requeue := resyncInterval
+	requeue := r.resyncInterval()
 	if pending > 0 {
 		r.setCondition(oi, openinspectv1alpha1.ConditionReady, metav1.ConditionFalse,
 			"ServiceBindingsPending", fmt.Sprintf("%d service bindings wait for their target worker", pending))
@@ -539,11 +552,17 @@ func (r *OpenInspectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		r.Recorder = mgr.GetEventRecorderFor("openinspect-operator") //nolint:staticcheck
 	}
 	return ctrl.NewControllerManagedBy(mgr).
-		// Generation-gated so our own status writes never re-trigger; drift
-		// and ConfigMap/Secret changes are covered by the periodic resync.
+		// Generation-gated so our own status writes never re-trigger.
 		For(&openinspectv1alpha1.OpenInspect{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		// Metadata-only watches: any change to a referenced ConfigMap/Secret
+		// re-reconciles immediately (the hash gate makes that cheap). The
+		// manager client reads these objects uncached — see cmd/main.go.
+		WatchesMetadata(&corev1.ConfigMap{}, handler.EnqueueRequestsFromMapFunc(r.mapReferencing(referencesConfigMap)),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{})).
+		WatchesMetadata(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.mapReferencing(referencesSecret)),
+			builder.WithPredicates(predicate.ResourceVersionChangedPredicate{})).
 		Named("openinspect").
 		Complete(r)
 }

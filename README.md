@@ -22,9 +22,12 @@ apply`, 13 `null_resource` script shims, `scripts/d1-migrate.sh`, and
 | Deletion | finalizer removes all Cloudflare resources; `deletionPolicy: Orphan` keeps them |
 
 Version uploads are gated by a content hash over script bytes, bindings,
-vars, and secret values — unchanged workers never churn new versions. The
-reconciler re-runs its idempotent ensure pass every 5 minutes, which is also
-the drift correction.
+vars, and secret values — unchanged workers never churn new versions.
+Referenced ConfigMaps and Secrets are **watched** (metadata-only, read
+uncached), so editing a bundle, migration, or rotated secret rolls out
+immediately — no CR touch needed. Independently, the idempotent ensure pass
+re-runs every 5 minutes as drift correction; tune it with the manager's
+`--resync-interval` flag.
 
 Removing a worker, KV namespace, or R2 bucket from the spec deletes it
 remotely (tracked in status, so this survives spec edits; a non-empty R2
