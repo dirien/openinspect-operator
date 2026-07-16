@@ -1,0 +1,101 @@
+apiVersion: openinspect.dirien.dev/v1alpha1
+kind: OpenInspect
+metadata:
+  labels:
+    app.kubernetes.io/name: openinspect-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: openinspect-sample
+spec:
+  # Suffixes every Cloudflare resource name; unique per account. Immutable.
+  deploymentName: prod
+  cloudflare:
+    accountId: "YOUR_CLOUDFLARE_ACCOUNT_ID"
+    apiTokenSecretRef: {name: cloudflare-credentials, key: apiToken}
+  d1:
+    # ConfigMap whose keys are numbered migration files (0001_xxx.sql, ...);
+    # applied in order, tracked in _schema_migrations by numeric prefix.
+    migrationsConfigMapRef: d1-migrations
+  kvNamespaces: [session-index, github, slack]
+  r2Buckets: [media]
+  workers:
+    - name: control-plane
+      script:
+        # Built worker bundle (esbuild dist/index.js) in a ConfigMap, or url:
+        configMapRef: {name: worker-bundles, key: control-plane.js}
+      compatibilityDate: "2024-12-30"
+      bindings:
+        d1: [{binding: DB}]
+        kv: [{binding: REPOS_CACHE, namespace: session-index}]
+        r2: [{binding: MEDIA_BUCKET, bucket: media}]
+        durableObjects:
+          - {binding: SESSION, className: SessionDO}
+          - {binding: SCHEDULER, className: SchedulerDO}
+        services:
+          - {binding: SLACK_BOT, worker: slack-bot}
+      vars:
+        APP_NAME: Open Inspect
+      secrets:
+        - binding: GITHUB_CLIENT_SECRET
+          secretRef: {name: platform-secrets, key: githubClientSecret}
+        - binding: TOKEN_ENCRYPTION_KEY
+          secretRef: {name: platform-secrets, key: tokenEncryptionKey}
+        - binding: INTERNAL_CALLBACK_SECRET
+          secretRef: {name: platform-secrets, key: internalCallbackSecret}
+      cron: ["* * * * *"]
+    - name: github-bot
+      script:
+        configMapRef: {name: worker-bundles, key: github-bot.js}
+      bindings:
+        kv: [{binding: GITHUB_KV, namespace: github}]
+        services: [{binding: CONTROL_PLANE, worker: control-plane}]
+      secrets:
+        - binding: GITHUB_WEBHOOK_SECRET
+          secretRef: {name: platform-secrets, key: githubWebhookSecret}
+        - binding: INTERNAL_CALLBACK_SECRET
+          secretRef: {name: platform-secrets, key: internalCallbackSecret}
+    - name: slack-bot
+      script:
+        configMapRef: {name: worker-bundles, key: slack-bot.js}
+      bindings:
+        kv: [{binding: SLACK_KV, namespace: slack}]
+        services: [{binding: CONTROL_PLANE, worker: control-plane}]
+      secrets:
+        - binding: SLACK_BOT_TOKEN
+          secretRef: {name: platform-secrets, key: slackBotToken}
+        - binding: SLACK_SIGNING_SECRET
+          secretRef: {name: platform-secrets, key: slackSigningSecret}
+  # Exactly one sandbox provider; its vars + secrets are injected into the
+  # control-plane worker (explicit worker values win over injected ones).
+  sandbox:
+    provider: modal            # modal | daytona | vercel | opencomputer
+    modal:
+      workspace: your-workspace
+      environment: main
+      tokenIdSecretRef: {name: platform-secrets, key: modalTokenId}
+      tokenSecretSecretRef: {name: platform-secrets, key: modalTokenSecret}
+      apiSecretSecretRef: {name: platform-secrets, key: modalApiSecret}
+    # daytona:
+    #   baseSnapshot: openinspect-base
+    #   apiKeySecretRef: {name: platform-secrets, key: daytonaApiKey}
+    # vercel:
+    #   projectId: prj_xxx
+    #   teamId: team_xxx
+    #   tokenSecretRef: {name: platform-secrets, key: vercelToken}
+    # openComputer:
+    #   apiUrl: https://api.opencomputer.example
+    #   template: openinspect-runtime
+    #   apiKeySecretRef: {name: platform-secrets, key: opencomputerApiKey}
+  # The web UI runs inside the cluster as a Deployment + Service.
+  web:
+    image: ghcr.io/your-org/open-inspect-web:latest
+    replicas: 1
+    port: 3000
+    env:
+      CONTROL_PLANE_URL: https://open-inspect-control-plane-prod.YOUR-SUBDOMAIN.workers.dev
+      NEXTAUTH_URL: https://inspect.example.com
+    secretEnv:
+      - binding: NEXTAUTH_SECRET
+        secretRef: {name: platform-secrets, key: nextauthSecret}
+      - binding: GITHUB_CLIENT_SECRET
+        secretRef: {name: platform-secrets, key: githubClientSecret}
+  deletionPolicy: Delete

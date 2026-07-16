@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cfmock
+  namespace: e2e-openinspect
+  labels: {app: cfmock}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: cfmock}
+  template:
+    metadata:
+      labels: {app: cfmock}
+    spec:
+      containers:
+        - name: cfmock
+          image: example.com/cfmock:e2e
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8787
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cfmock
+  namespace: e2e-openinspect
+spec:
+  selector: {app: cfmock}
+  ports:
+    - port: 8787
+      targetPort: 8787

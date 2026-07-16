@@ -1,0 +1,650 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: openinspects.openinspect.dirien.dev
+spec:
+  group: openinspect.dirien.dev
+  names:
+    kind: OpenInspect
+    listKind: OpenInspectList
+    plural: openinspects
+    shortNames:
+    - oi
+    singular: openinspect
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].reason
+      name: Reason
+      type: string
+    - jsonPath: .status.appliedMigrations
+      name: Migrations
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: OpenInspect is the Schema for the openinspects API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              OpenInspectSpec defines the desired state of one full deployment of the
+              open-inspect platform: all Cloudflare resources plus the in-cluster web UI.
+            properties:
+              cloudflare:
+                description: CloudflareSpec holds account credentials and API endpoint.
+                properties:
+                  accountId:
+                    description: AccountID is the Cloudflare account ID all resources
+                      are created under.
+                    type: string
+                  apiBaseURL:
+                    description: |-
+                      APIBaseURL overrides the Cloudflare API endpoint. Leave empty for
+                      https://api.cloudflare.com/client/v4. Used for regional gateways and
+                      for e2e tests against a mock API.
+                    type: string
+                  apiTokenSecretRef:
+                    description: APITokenSecretRef points at the API token used for
+                      all Cloudflare calls.
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                required:
+                - accountId
+                - apiTokenSecretRef
+                type: object
+              d1:
+                description: D1Spec describes the single D1 database and its schema
+                  migrations.
+                properties:
+                  migrationsConfigMapRef:
+                    description: |-
+                      MigrationsConfigMapRef names a ConfigMap whose keys are numbered
+                      migration files (e.g. 0001_init.sql). They are applied in key order and
+                      tracked in a _schema_migrations table by numeric prefix, matching the
+                      upstream d1-migrate.sh semantics.
+                    type: string
+                type: object
+              deletionPolicy:
+                default: Delete
+                description: |-
+                  DeletionPolicy controls whether Cloudflare resources are deleted or
+                  orphaned when the CR is deleted.
+                enum:
+                - Delete
+                - Orphan
+                type: string
+              deploymentName:
+                description: |-
+                  DeploymentName suffixes every Cloudflare resource name and must be
+                  unique per Cloudflare account.
+                pattern: ^[a-z0-9][a-z0-9-]*$
+                type: string
+                x-kubernetes-validations:
+                - message: deploymentName is immutable
+                  rule: self == oldSelf
+              kvNamespaces:
+                description: |-
+                  KVNamespaces are logical names; the Cloudflare title becomes
+                  <namePrefix>-<name>-<deploymentName>.
+                items:
+                  pattern: ^[a-z0-9][a-z0-9-]*$
+                  type: string
+                type: array
+              namePrefix:
+                default: open-inspect
+                pattern: ^[a-z0-9][a-z0-9-]*$
+                type: string
+              r2Buckets:
+                description: R2Buckets are logical names, expanded like KV namespaces.
+                items:
+                  pattern: ^[a-z0-9][a-z0-9-]*$
+                  type: string
+                type: array
+              sandbox:
+                description: |-
+                  Sandbox wires one sandbox provider's configuration into the
+                  control-plane worker.
+                properties:
+                  controlPlaneWorker:
+                    default: control-plane
+                    description: |-
+                      ControlPlaneWorker names the worker (from spec.workers) that receives
+                      the provider configuration.
+                    type: string
+                  daytona:
+                    description: DaytonaSandboxSpec configures the Daytona sandbox
+                      provider.
+                    properties:
+                      apiKeySecretRef:
+                        description: SecretKeyRef selects a key of a Secret in the
+                          same namespace.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      apiUrl:
+                        type: string
+                      baseSnapshot:
+                        description: |-
+                          BaseSnapshot is the name of a prebuilt Daytona snapshot containing the
+                          sandbox runtime.
+                        type: string
+                      target:
+                        type: string
+                    required:
+                    - apiKeySecretRef
+                    - baseSnapshot
+                    type: object
+                  inactivityTimeoutMs:
+                    description: InactivityTimeoutMS stops idle sandboxes after this
+                      many milliseconds.
+                    format: int64
+                    type: integer
+                  modal:
+                    description: |-
+                      ModalSandboxSpec configures the Modal sandbox provider. The Modal app
+                      itself is deployed with `modal deploy` (CLI-only upstream); the operator
+                      wires the control plane to it.
+                    properties:
+                      apiSecretSecretRef:
+                        description: SecretKeyRef selects a key of a Secret in the
+                          same namespace.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      environment:
+                        default: main
+                        type: string
+                      environmentWebSuffix:
+                        type: string
+                      tokenIdSecretRef:
+                        description: SecretKeyRef selects a key of a Secret in the
+                          same namespace.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      tokenSecretSecretRef:
+                        description: SecretKeyRef selects a key of a Secret in the
+                          same namespace.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      workspace:
+                        type: string
+                    required:
+                    - apiSecretSecretRef
+                    - tokenIdSecretRef
+                    - tokenSecretSecretRef
+                    - workspace
+                    type: object
+                  openComputer:
+                    description: OpenComputerSandboxSpec configures the OpenComputer
+                      sandbox provider.
+                    properties:
+                      apiKeySecretRef:
+                        description: SecretKeyRef selects a key of a Secret in the
+                          same namespace.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      apiUrl:
+                        type: string
+                      template:
+                        description: Template is the OpenComputer template/snapshot
+                          to boot sandboxes from.
+                        type: string
+                    required:
+                    - apiKeySecretRef
+                    - apiUrl
+                    - template
+                    type: object
+                  provider:
+                    enum:
+                    - modal
+                    - daytona
+                    - vercel
+                    - opencomputer
+                    type: string
+                  vercel:
+                    description: |-
+                      VercelSandboxSpec configures the Vercel sandbox provider. The control
+                      plane calls the Vercel Sandbox REST API directly.
+                    properties:
+                      apiBaseUrl:
+                        type: string
+                      baseSnapshotId:
+                        description: BaseSnapshotID pins a prebuilt snapshot by ID.
+                        type: string
+                      baseSnapshotName:
+                        description: BaseSnapshotName pins a prebuilt snapshot by
+                          name.
+                        type: string
+                      projectId:
+                        type: string
+                      runtime:
+                        default: node24
+                        type: string
+                      snapshotExpirationMs:
+                        format: int64
+                        type: integer
+                      teamId:
+                        type: string
+                      tokenSecretRef:
+                        description: SecretKeyRef selects a key of a Secret in the
+                          same namespace.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                    required:
+                    - projectId
+                    - tokenSecretRef
+                    type: object
+                required:
+                - provider
+                type: object
+              web:
+                description: WebSpec runs the web UI inside the cluster as a Deployment
+                  + Service.
+                properties:
+                  env:
+                    additionalProperties:
+                      type: string
+                    description: Env are plain environment variables.
+                    type: object
+                  image:
+                    description: Image is the container image of the web app.
+                    type: string
+                  port:
+                    default: 3000
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                  replicas:
+                    default: 1
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  secretEnv:
+                    description: SecretEnv injects environment variables from Secret
+                      keys.
+                    items:
+                      description: WorkerSecret maps a Kubernetes Secret key to a
+                        secret binding / env var.
+                      properties:
+                        binding:
+                          pattern: ^[A-Za-z_][A-Za-z0-9_]*$
+                          type: string
+                        secretRef:
+                          description: SecretKeyRef selects a key of a Secret in the
+                            same namespace.
+                          properties:
+                            key:
+                              type: string
+                            name:
+                              type: string
+                          required:
+                          - key
+                          - name
+                          type: object
+                      required:
+                      - binding
+                      - secretRef
+                      type: object
+                    type: array
+                required:
+                - image
+                type: object
+              workers:
+                items:
+                  description: WorkerSpec describes one Cloudflare Worker.
+                  properties:
+                    bindings:
+                      description: WorkerBindings groups all binding kinds for one
+                        worker.
+                      properties:
+                        d1:
+                          items:
+                            description: D1Binding attaches the database to a worker.
+                            properties:
+                              binding:
+                                description: Binding is the variable name exposed
+                                  to the worker (e.g. DB).
+                                type: string
+                            required:
+                            - binding
+                            type: object
+                          type: array
+                        durableObjects:
+                          items:
+                            description: DurableObjectBinding declares a Durable Object
+                              class the worker defines.
+                            properties:
+                              binding:
+                                type: string
+                              className:
+                                type: string
+                            required:
+                            - binding
+                            - className
+                            type: object
+                          type: array
+                        kv:
+                          items:
+                            description: KVBinding attaches a KV namespace to a worker.
+                            properties:
+                              binding:
+                                type: string
+                              namespace:
+                                description: Namespace is the logical name from spec.kvNamespaces.
+                                type: string
+                            required:
+                            - binding
+                            - namespace
+                            type: object
+                          type: array
+                        r2:
+                          items:
+                            description: R2Binding attaches an R2 bucket to a worker.
+                            properties:
+                              binding:
+                                type: string
+                              bucket:
+                                description: Bucket is the logical name from spec.r2Buckets.
+                                type: string
+                            required:
+                            - binding
+                            - bucket
+                            type: object
+                          type: array
+                        services:
+                          items:
+                            description: ServiceBinding attaches another worker managed
+                              by this CR.
+                            properties:
+                              binding:
+                                type: string
+                              worker:
+                                description: |-
+                                  Worker is the logical name from spec.workers. If the target worker does
+                                  not exist on Cloudflare yet, the binding is added on a later reconcile
+                                  pass once it does.
+                                type: string
+                            required:
+                            - binding
+                            - worker
+                            type: object
+                          type: array
+                      type: object
+                    compatibilityDate:
+                      default: "2024-12-30"
+                      type: string
+                    compatibilityFlags:
+                      items:
+                        type: string
+                      type: array
+                    cron:
+                      description: Cron schedules for the worker (e.g. "* * * * *").
+                      items:
+                        type: string
+                      type: array
+                    name:
+                      description: |-
+                        Name is the logical name (e.g. control-plane). The Cloudflare script
+                        name becomes <namePrefix>-<name>-<deploymentName>.
+                      pattern: ^[a-z0-9][a-z0-9-]*$
+                      type: string
+                    script:
+                      description: |-
+                        ScriptSource locates the built worker bundle (ESM, single module).
+                        Exactly one of configMapRef or url must be set.
+                      properties:
+                        configMapRef:
+                          description: ConfigMapKeyRef selects a key of a ConfigMap
+                            in the same namespace.
+                          properties:
+                            key:
+                              type: string
+                            name:
+                              type: string
+                          required:
+                          - key
+                          - name
+                          type: object
+                        url:
+                          maxLength: 2048
+                          type: string
+                      type: object
+                      x-kubernetes-validations:
+                      - message: exactly one of configMapRef or url must be set
+                        rule: has(self.configMapRef) != has(self.url)
+                    secrets:
+                      description: Secrets become secret_text bindings, values read
+                        from Secrets.
+                      items:
+                        description: WorkerSecret maps a Kubernetes Secret key to
+                          a secret binding / env var.
+                        properties:
+                          binding:
+                            pattern: ^[A-Za-z_][A-Za-z0-9_]*$
+                            type: string
+                          secretRef:
+                            description: SecretKeyRef selects a key of a Secret in
+                              the same namespace.
+                            properties:
+                              key:
+                                type: string
+                              name:
+                                type: string
+                            required:
+                            - key
+                            - name
+                            type: object
+                        required:
+                        - binding
+                        - secretRef
+                        type: object
+                      type: array
+                    vars:
+                      additionalProperties:
+                        type: string
+                      description: Vars become plain_text bindings (environment variables).
+                      type: object
+                  required:
+                  - name
+                  - script
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+            required:
+            - cloudflare
+            - deploymentName
+            type: object
+          status:
+            description: OpenInspectStatus defines the observed state of OpenInspect.
+            properties:
+              appliedMigrations:
+                description: AppliedMigrations is the number of migrations recorded
+                  as applied.
+                type: integer
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              d1DatabaseId:
+                description: D1DatabaseID is the UUID of the created database.
+                type: string
+              kvNamespaceIds:
+                additionalProperties:
+                  type: string
+                description: KVNamespaceIDs maps logical KV names to Cloudflare namespace
+                  IDs.
+                type: object
+              observedGeneration:
+                format: int64
+                type: integer
+              r2Buckets:
+                additionalProperties:
+                  type: string
+                description: |-
+                  R2Buckets maps logical bucket names to full Cloudflare bucket names, so
+                  deletion works from observed state even after spec edits.
+                type: object
+              workers:
+                additionalProperties:
+                  description: WorkerStatus records what is live for one worker.
+                  properties:
+                    appliedHash:
+                      description: |-
+                        AppliedHash is the hash of the last uploaded version's inputs (script
+                        content, bindings, vars, secret values). A new version is only uploaded
+                        when it changes.
+                      type: string
+                    doClasses:
+                      description: |-
+                        DOClasses records Durable Object classes already declared to Cloudflare
+                        via migrations; new spec classes are diffed against this on upload.
+                      items:
+                        type: string
+                      type: array
+                    scriptName:
+                      description: ScriptName is the full Cloudflare script name.
+                      type: string
+                    serviceBindingsPending:
+                      description: |-
+                        ServiceBindingsPending lists service bindings waiting for their target
+                        worker to exist.
+                      items:
+                        type: string
+                      type: array
+                  type: object
+                description: Workers maps logical worker names to their live state.
+                type: object
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

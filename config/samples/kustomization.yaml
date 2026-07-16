@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- openinspect_v1alpha1_openinspect.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

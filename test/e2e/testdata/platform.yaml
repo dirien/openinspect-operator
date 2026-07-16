@@ -1,0 +1,93 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cf-creds
+  namespace: e2e-openinspect
+stringData:
+  apiToken: e2e-test-token
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cp-secrets
+  namespace: e2e-openinspect
+stringData:
+  githubClientSecret: e2e-gh-secret
+  internalCallbackSecret: e2e-callback
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: d1-migrations
+  namespace: e2e-openinspect
+data:
+  0001_create_sessions.sql: |
+    CREATE TABLE sessions (id TEXT PRIMARY KEY, created_at TEXT);
+  0002_create_repo_secrets.sql: |
+    CREATE TABLE repo_secrets (id TEXT PRIMARY KEY, value TEXT);
+    CREATE INDEX idx_repo_secrets ON repo_secrets(id);
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bundles
+  namespace: e2e-openinspect
+data:
+  control-plane.js: |
+    export default { fetch() { return new Response("control-plane") } }
+  github-bot.js: |
+    export default { fetch() { return new Response("github-bot") } }
+---
+apiVersion: openinspect.dirien.dev/v1alpha1
+kind: OpenInspect
+metadata:
+  name: e2e
+  namespace: e2e-openinspect
+spec:
+  deploymentName: e2e
+  cloudflare:
+    accountId: acc-e2e
+    apiTokenSecretRef: {name: cf-creds, key: apiToken}
+    apiBaseURL: http://cfmock.e2e-openinspect.svc.cluster.local:8787
+  d1:
+    migrationsConfigMapRef: d1-migrations
+  kvNamespaces: [session-index, github]
+  r2Buckets: [media]
+  workers:
+    - name: control-plane
+      script:
+        configMapRef: {name: bundles, key: control-plane.js}
+      bindings:
+        d1: [{binding: DB}]
+        kv: [{binding: REPOS_CACHE, namespace: session-index}]
+        r2: [{binding: MEDIA_BUCKET, bucket: media}]
+        durableObjects:
+          - {binding: SESSION, className: SessionDO}
+          - {binding: SCHEDULER, className: SchedulerDO}
+      vars:
+        APP_NAME: Open Inspect E2E
+        SANDBOX_PROVIDER: vercel
+      secrets:
+        - binding: GITHUB_CLIENT_SECRET
+          secretRef: {name: cp-secrets, key: githubClientSecret}
+        - binding: INTERNAL_CALLBACK_SECRET
+          secretRef: {name: cp-secrets, key: internalCallbackSecret}
+      cron: ["* * * * *"]
+    - name: github-bot
+      script:
+        configMapRef: {name: bundles, key: github-bot.js}
+      bindings:
+        kv: [{binding: GITHUB_KV, namespace: github}]
+        services: [{binding: CONTROL_PLANE, worker: control-plane}]
+      secrets:
+        - binding: INTERNAL_CALLBACK_SECRET
+          secretRef: {name: cp-secrets, key: internalCallbackSecret}
+  web:
+    # the cfmock image doubles as a stand-in web app: a Go HTTP server on 8787
+    image: example.com/cfmock:e2e
+    port: 8787
+    env:
+      CONTROL_PLANE_URL: https://open-inspect-control-plane-e2e.example.workers.dev
+    secretEnv:
+      - binding: INTERNAL_CALLBACK_SECRET
+        secretRef: {name: cp-secrets, key: internalCallbackSecret}
