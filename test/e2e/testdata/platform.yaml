@@ -14,6 +14,7 @@ metadata:
 stringData:
   githubClientSecret: e2e-gh-secret
   internalCallbackSecret: e2e-callback
+  vercelToken: e2e-vercel-token
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -66,7 +67,6 @@ spec:
           - {binding: SCHEDULER, className: SchedulerDO}
       vars:
         APP_NAME: Open Inspect E2E
-        SANDBOX_PROVIDER: vercel
       secrets:
         - binding: GITHUB_CLIENT_SECRET
           secretRef: {name: cp-secrets, key: githubClientSecret}
@@ -82,6 +82,12 @@ spec:
       secrets:
         - binding: INTERNAL_CALLBACK_SECRET
           secretRef: {name: cp-secrets, key: internalCallbackSecret}
+  sandbox:
+    provider: vercel
+    vercel:
+      projectId: prj_e2e_test
+      teamId: team_e2e
+      tokenSecretRef: {name: cp-secrets, key: vercelToken}
   web:
     # the cfmock image doubles as a stand-in web app: a Go HTTP server on 8787
     image: example.com/cfmock:e2e

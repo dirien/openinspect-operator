@@ -348,6 +348,11 @@ var _ = Describe("Manager", Ordered, func() {
 			Expect(state).To(ContainSubstring("SessionDO"))
 			Expect(state).To(ContainSubstring(`"* * * * *"`))
 
+			By("verifying sandbox provider injection on the control-plane worker")
+			Expect(state).To(ContainSubstring(`"name":"SANDBOX_PROVIDER","text":"vercel"`))
+			Expect(state).To(ContainSubstring(`"name":"VERCEL_PROJECT_ID","text":"prj_e2e_test"`))
+			Expect(state).To(ContainSubstring(`"name":"VERCEL_TOKEN","text":"e2e-vercel-token"`))
+
 			By("verifying the web UI runs in-cluster")
 			cmd = exec.Command("kubectl", "rollout", "status", "deployment/e2e-web",
 				"-n", oiNamespace, "--timeout=120s")
