@@ -27,21 +27,23 @@ type workerState struct {
 
 // Server holds all mock account state.
 type Server struct {
-	mu      sync.Mutex
-	d1Names map[string]string // name -> uuid
-	d1DBs   map[string]*sql.DB
-	kv      map[string]string // id -> title
-	r2      map[string]bool
-	workers map[string]*workerState
+	mu        sync.Mutex
+	d1Names   map[string]string // name -> uuid
+	d1DBs     map[string]*sql.DB
+	kv        map[string]string // id -> title
+	r2        map[string]bool
+	r2Objects map[string]map[string]bool // bucket -> object keys
+	workers   map[string]*workerState
 }
 
 func New() *Server {
 	return &Server{
-		d1Names: map[string]string{},
-		d1DBs:   map[string]*sql.DB{},
-		kv:      map[string]string{},
-		r2:      map[string]bool{},
-		workers: map[string]*workerState{},
+		d1Names:   map[string]string{},
+		d1DBs:     map[string]*sql.DB{},
+		kv:        map[string]string{},
+		r2:        map[string]bool{},
+		r2Objects: map[string]map[string]bool{},
+		workers:   map[string]*workerState{},
 	}
 }
 
@@ -58,11 +60,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /accounts/{account}/r2/buckets/{name}", s.r2Get)
 	mux.HandleFunc("POST /accounts/{account}/r2/buckets", s.r2Create)
 	mux.HandleFunc("DELETE /accounts/{account}/r2/buckets/{name}", s.r2Delete)
+	mux.HandleFunc("GET /accounts/{account}/r2/buckets/{name}/objects", s.r2ObjectList)
+	mux.HandleFunc("PUT /accounts/{account}/r2/buckets/{name}/objects/{key...}", s.r2ObjectPut)
+	mux.HandleFunc("DELETE /accounts/{account}/r2/buckets/{name}/objects/{key...}", s.r2ObjectDelete)
 	mux.HandleFunc("GET /accounts/{account}/workers/scripts", s.workerList)
 	mux.HandleFunc("PUT /accounts/{account}/workers/scripts/{name}", s.workerUpload)
 	mux.HandleFunc("DELETE /accounts/{account}/workers/scripts/{name}", s.workerDelete)
 	mux.HandleFunc("PUT /accounts/{account}/workers/scripts/{name}/schedules", s.workerSchedules)
 	mux.HandleFunc("POST /accounts/{account}/workers/scripts/{name}/subdomain", s.workerSubdomain)
+	mux.HandleFunc("GET /accounts/{account}/workers/subdomain", s.accountSubdomain)
 	return authWrap(mux)
 }
 
@@ -293,7 +299,56 @@ func (s *Server) r2Create(w http.ResponseWriter, r *http.Request) {
 func (s *Server) r2Delete(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.r2, r.PathValue("name"))
+	name := r.PathValue("name")
+	// Real R2 refuses to delete a non-empty bucket.
+	if len(s.r2Objects[name]) > 0 {
+		apiError(w, http.StatusConflict, 10008, "The bucket you tried to delete is not empty")
+		return
+	}
+	delete(s.r2, name)
+	delete(s.r2Objects, name)
+	ok(w, nil)
+}
+
+func (s *Server) r2ObjectList(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name := r.PathValue("name")
+	if !s.r2[name] {
+		apiError(w, http.StatusNotFound, 10006, "bucket not found")
+		return
+	}
+	list := []map[string]any{}
+	for key := range s.r2Objects[name] {
+		list = append(list, map[string]any{"key": key})
+	}
+	// Single page; empty cursor terminates the SDK's cursor pager.
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"success": true, "errors": []any{}, "messages": []any{}, "result": list,
+		"result_info": map[string]any{"cursor": "", "per_page": 1000},
+	})
+}
+
+func (s *Server) r2ObjectPut(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	name := r.PathValue("name")
+	if !s.r2[name] {
+		apiError(w, http.StatusNotFound, 10006, "bucket not found")
+		return
+	}
+	if s.r2Objects[name] == nil {
+		s.r2Objects[name] = map[string]bool{}
+	}
+	s.r2Objects[name][r.PathValue("key")] = true
+	ok(w, map[string]any{"key": r.PathValue("key")})
+}
+
+func (s *Server) r2ObjectDelete(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.r2Objects[r.PathValue("name")], r.PathValue("key"))
 	ok(w, nil)
 }
 
@@ -420,4 +475,9 @@ func (s *Server) workerSubdomain(w http.ResponseWriter, r *http.Request) {
 	}
 	worker.Subdomain = body.Enabled
 	ok(w, map[string]any{"enabled": body.Enabled})
+}
+
+// accountSubdomain serves the account-level workers.dev subdomain name.
+func (s *Server) accountSubdomain(w http.ResponseWriter, _ *http.Request) {
+	ok(w, map[string]any{"subdomain": "cfmock", "enabled": true})
 }

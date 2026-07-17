@@ -20,6 +20,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -70,8 +71,25 @@ type OpenInspectReconciler struct {
 	// drift correction (--resync-interval flag); zero means the default.
 	ResyncInterval time.Duration
 
+	// Live reads the primary object straight from the API server, bypassing
+	// the informer cache (mgr.GetAPIReader()); nil falls back to Client.
+	Live client.Reader
+
 	// NewCF is swappable in tests; defaults to cfclient.New.
 	NewCF func(accountID, apiToken, baseURL string) *cfclient.Client
+	// ModalCleanup is swappable in tests; defaults to cleanupModalApp.
+	ModalCleanup func(context.Context, *openinspectv1alpha1.ModalSandboxSpec, string, string) (int, bool, error)
+	// DaytonaCleanup is swappable in tests; defaults to sweepDaytonaSandboxes.
+	DaytonaCleanup func(context.Context, *openinspectv1alpha1.DaytonaSandboxSpec, string, map[string]struct{}) (int, error)
+	// AppSecretsURL overrides the global-secrets endpoint derivation in tests.
+	AppSecretsURL func(*openinspectv1alpha1.OpenInspect) string
+}
+
+func (r *OpenInspectReconciler) liveReader() client.Reader {
+	if r.Live != nil {
+		return r.Live
+	}
+	return r.Client
 }
 
 func (r *OpenInspectReconciler) resyncInterval() time.Duration {
@@ -95,8 +113,12 @@ func (r *OpenInspectReconciler) resyncInterval() time.Duration {
 func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	// The primary object is read LIVE, never from the informer cache: a
+	// reconcile racing the cache can otherwise observe pre-mutation status
+	// and, via its own persistStatus, wipe recorded resource IDs — after
+	// which the ownership checks reject resources this CR itself created.
 	oi := &openinspectv1alpha1.OpenInspect{}
-	if err := r.Get(ctx, req.NamespacedName, oi); err != nil {
+	if err := r.liveReader().Get(ctx, req.NamespacedName, oi); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -106,6 +128,10 @@ func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcileDelete(ctx, oi)
 	}
 
+	if oi.Spec.Suspended {
+		return r.reconcileSuspended(ctx, oi)
+	}
+
 	if err := validateSpec(oi); err != nil {
 		// Terminal until the spec changes: no backoff, generation predicate
 		// retriggers on edit.
@@ -113,6 +139,17 @@ func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		r.Recorder.Event(oi, corev1.EventTypeWarning, "InvalidSpec", err.Error())
 		oi.Status.ObservedGeneration = oi.Generation
 		return ctrl.Result{}, r.persistStatus(ctx, oi)
+	}
+
+	// Before any remote call: refuse to run if an older CR already claims the
+	// same account-level names, so two CRs can never capture each other's
+	// Cloudflare resources.
+	if owner, err := r.claimConflict(ctx, oi); err != nil {
+		return ctrl.Result{}, err
+	} else if owner != "" {
+		err := fmt.Errorf("deploymentName %q on account %q is already claimed by OpenInspect %s; choose a different deploymentName",
+			oi.Spec.DeploymentName, oi.Spec.Cloudflare.AccountID, owner)
+		return r.failed(ctx, oi, openinspectv1alpha1.ConditionReady, "DeploymentNameConflict", err)
 	}
 
 	cf, err := r.cloudflareClient(ctx, oi)
@@ -126,18 +163,26 @@ func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		}
 	}
 
-	if err := r.ensureD1(ctx, oi, cf); err != nil {
+	if err := timed("d1", func() error { return r.ensureD1(ctx, oi, cf) }); err != nil {
 		return r.failed(ctx, oi, openinspectv1alpha1.ConditionD1, "D1Failed", err)
 	}
-	if err := r.ensureStorage(ctx, oi, cf); err != nil {
+	if err := timed("storage", func() error { return r.ensureStorage(ctx, oi, cf) }); err != nil {
 		return r.failed(ctx, oi, openinspectv1alpha1.ConditionStorage, "StorageFailed", err)
 	}
-	pending, err := r.ensureWorkers(ctx, oi, cf)
+	var pending int
+	err = timed("workers", func() error {
+		var werr error
+		pending, werr = r.ensureWorkers(ctx, oi, cf)
+		return werr
+	})
 	if err != nil {
 		return r.failed(ctx, oi, openinspectv1alpha1.ConditionWorkers, "WorkersFailed", err)
 	}
-	if err := r.ensureWeb(ctx, oi); err != nil {
+	if err := timed("web", func() error { return r.ensureWeb(ctx, oi) }); err != nil {
 		return r.failed(ctx, oi, openinspectv1alpha1.ConditionWeb, "WebFailed", err)
+	}
+	if err := timed("appsecrets", func() error { return r.ensureAppSecrets(ctx, oi, cf) }); err != nil {
+		return r.failed(ctx, oi, openinspectv1alpha1.ConditionAppSecrets, "AppSecretsFailed", err)
 	}
 
 	requeue := r.resyncInterval()
@@ -156,6 +201,47 @@ func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
+// reconcileSuspended parks the CR: the web Deployment is scaled to zero and
+// no remote calls happen until spec.suspended is cleared, at which point the
+// generation predicate retriggers a normal pass that restores everything.
+func (r *OpenInspectReconciler) reconcileSuspended(ctx context.Context, oi *openinspectv1alpha1.OpenInspect) (ctrl.Result, error) {
+	deploy := &appsv1.Deployment{}
+	switch err := r.Get(ctx, types.NamespacedName{Name: oi.Name + "-web", Namespace: oi.Namespace}, deploy); {
+	case client.IgnoreNotFound(err) != nil:
+		return ctrl.Result{}, err
+	// Only a deployment this CR owns is scaled: suspension runs before any
+	// validation or claim check, so a same-named unrelated workload must
+	// never be touched.
+	case err == nil && metav1.IsControlledBy(deploy, oi) &&
+		(deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != 0):
+		zero := int32(0)
+		deploy.Spec.Replicas = &zero
+		if err := r.Update(ctx, deploy); err != nil {
+			return ctrl.Result{}, err
+		}
+		r.Recorder.Event(oi, corev1.EventTypeNormal, "Suspended", "web deployment scaled to zero")
+	}
+	r.setCondition(oi, openinspectv1alpha1.ConditionReady, metav1.ConditionFalse, "Suspended",
+		"reconciliation suspended by spec.suspended")
+	oi.Status.ObservedGeneration = oi.Generation
+	return ctrl.Result{}, r.persistStatus(ctx, oi)
+}
+
+// deleteR2Bucket removes a bucket, purging its objects first when
+// spec.emptyBucketsOnDelete is set.
+func (r *OpenInspectReconciler) deleteR2Bucket(ctx context.Context, oi *openinspectv1alpha1.OpenInspect, cf *cfclient.Client, full string) error {
+	if oi.Spec.EmptyBucketsOnDelete {
+		purged, err := cf.PurgeR2(ctx, full)
+		if err != nil {
+			return err
+		}
+		if purged > 0 {
+			r.Recorder.Eventf(oi, corev1.EventTypeNormal, "R2BucketPurged", "deleted %d objects from %s", purged, full)
+		}
+	}
+	return cf.DeleteR2(ctx, full)
+}
+
 func (r *OpenInspectReconciler) cloudflareClient(ctx context.Context, oi *openinspectv1alpha1.OpenInspect) (*cfclient.Client, error) {
 	token, err := r.secretValue(ctx, oi.Namespace, oi.Spec.Cloudflare.APITokenSecretRef)
 	if err != nil {
@@ -172,9 +258,14 @@ func (r *OpenInspectReconciler) ensureD1(ctx context.Context, oi *openinspectv1a
 	if oi.Spec.D1 == nil {
 		return nil
 	}
-	id, err := cf.EnsureD1(ctx, oi.ResourceName("db"))
+	id, created, err := cf.EnsureD1(ctx, oi.ResourceName("db"))
 	if err != nil {
 		return err
+	}
+	// Covers both a fresh CR finding a foreign database and our recorded
+	// database having been replaced by one we did not create.
+	if !created && !oi.Spec.AdoptExisting && oi.Status.D1DatabaseID != id {
+		return conflictf("d1 database %q already exists and is not owned by this OpenInspect (set spec.adoptExisting to take it over)", oi.ResourceName("db"))
 	}
 	oi.Status.D1DatabaseID = id
 
@@ -201,20 +292,40 @@ func (r *OpenInspectReconciler) ensureStorage(ctx context.Context, oi *openinspe
 	if oi.Status.R2Buckets == nil {
 		oi.Status.R2Buckets = map[string]string{}
 	}
+	kvTitles := map[string]string{}
+	if len(oi.Spec.KVNamespaces) > 0 {
+		titles, err := cf.ListKVTitles(ctx)
+		if err != nil {
+			return err
+		}
+		kvTitles = titles
+	}
 	inSpecKV := map[string]bool{}
 	for _, name := range oi.Spec.KVNamespaces {
 		inSpecKV[name] = true
-		id, err := cf.EnsureKV(ctx, oi.ResourceName(name))
-		if err != nil {
-			return err
+		full := oi.ResourceName(name)
+		id, exists := kvTitles[full]
+		switch {
+		case !exists:
+			created, err := cf.CreateKV(ctx, full)
+			if err != nil {
+				return err
+			}
+			id = created
+		case !oi.Spec.AdoptExisting && oi.Status.KVNamespaceIDs[name] != id:
+			return conflictf("kv namespace %q already exists and is not owned by this OpenInspect (set spec.adoptExisting to take it over)", full)
 		}
 		oi.Status.KVNamespaceIDs[name] = id
 	}
 	inSpecR2 := map[string]bool{}
 	for _, name := range oi.Spec.R2Buckets {
 		inSpecR2[name] = true
-		if err := cf.EnsureR2(ctx, oi.ResourceName(name)); err != nil {
+		created, err := cf.EnsureR2(ctx, oi.ResourceName(name))
+		if err != nil {
 			return err
+		}
+		if !created && !oi.Spec.AdoptExisting && oi.Status.R2Buckets[name] == "" {
+			return conflictf("r2 bucket %q already exists and is not owned by this OpenInspect (set spec.adoptExisting to take it over)", oi.ResourceName(name))
 		}
 		oi.Status.R2Buckets[name] = oi.ResourceName(name)
 	}
@@ -230,9 +341,10 @@ func (r *OpenInspectReconciler) ensureStorage(ctx context.Context, oi *openinspe
 	}
 	for name, full := range oi.Status.R2Buckets {
 		if !inSpecR2[name] {
-			if err := cf.DeleteR2(ctx, full); err != nil {
-				// A non-empty bucket cannot be deleted via the API: orphan it
-				// with a warning rather than wedging the whole reconcile.
+			if err := r.deleteR2Bucket(ctx, oi, cf, full); err != nil {
+				// A non-empty bucket cannot be deleted via the API (unless
+				// spec.emptyBucketsOnDelete purges it): orphan it with a
+				// warning rather than wedging the whole reconcile.
 				r.Recorder.Eventf(oi, corev1.EventTypeWarning, "R2BucketOrphaned", "could not delete %s: %v", full, err)
 			} else {
 				r.Recorder.Eventf(oi, corev1.EventTypeNormal, "R2BucketDeleted", "removed from spec: %s", full)
@@ -270,6 +382,11 @@ func (r *OpenInspectReconciler) ensureWorkers(ctx context.Context, oi *openinspe
 		// Record the script name before any remote mutation so deletion can
 		// always find what may have been created.
 		st := oi.Status.Workers[w.Name]
+		// A script we never touched (no status entry) that already exists
+		// remotely belongs to someone else.
+		if st.ScriptName == "" && existing[scriptName] && !oi.Spec.AdoptExisting {
+			return pending, conflictf("worker script %q already exists and is not owned by this OpenInspect (set spec.adoptExisting to take it over)", scriptName)
+		}
 		st.ScriptName = scriptName
 		oi.Status.Workers[w.Name] = st
 
@@ -321,23 +438,8 @@ func (r *OpenInspectReconciler) ensureWorkers(ctx context.Context, oi *openinspe
 		pending += len(pendingBindings)
 
 		if st.AppliedHash != hash || !existing[scriptName] {
-			// Durable Object classes must be introduced via migrations; diff
-			// spec classes against what was already declared.
-			declared := map[string]bool{}
-			if existing[scriptName] {
-				for _, c := range st.DOClasses {
-					declared[c] = true
-				}
-			}
-			var newClasses []string
-			allClasses := make([]string, 0, len(w.Bindings.DurableObjects))
-			for _, d := range w.Bindings.DurableObjects {
-				allClasses = append(allClasses, d.ClassName)
-				if !declared[d.ClassName] {
-					newClasses = append(newClasses, d.ClassName)
-				}
-			}
-			err := cf.UploadWorker(ctx, cfclient.WorkerUpload{
+			newClasses, allClasses := diffDOClasses(w, st, existing[scriptName])
+			err := r.uploadWorkerVersion(ctx, oi, cf, cfclient.WorkerUpload{
 				ScriptName:         scriptName,
 				Script:             script,
 				CompatibilityDate:  w.CompatibilityDate,
@@ -384,6 +486,41 @@ func (r *OpenInspectReconciler) ensureWorkers(ctx context.Context, oi *openinspe
 			fmt.Sprintf("%d workers deployed", len(oi.Spec.Workers)))
 	}
 	return pending, nil
+}
+
+// diffDOClasses returns the Durable Object classes to declare as new via
+// migration (classes must be introduced exactly once) and the full set the
+// worker defines.
+func diffDOClasses(w openinspectv1alpha1.WorkerSpec, st openinspectv1alpha1.WorkerStatus, exists bool) (newClasses, allClasses []string) {
+	declared := map[string]bool{}
+	if exists {
+		for _, c := range st.DOClasses {
+			declared[c] = true
+		}
+	}
+	allClasses = make([]string, 0, len(w.Bindings.DurableObjects))
+	for _, d := range w.Bindings.DurableObjects {
+		allClasses = append(allClasses, d.ClassName)
+		if !declared[d.ClassName] {
+			newClasses = append(newClasses, d.ClassName)
+		}
+	}
+	return newClasses, allClasses
+}
+
+// uploadWorkerVersion uploads a version, adopting already-declared Durable
+// Object classes when Cloudflare rejects a re-declaration (error 10074, e.g.
+// after recorded state was lost).
+func (r *OpenInspectReconciler) uploadWorkerVersion(ctx context.Context, oi *openinspectv1alpha1.OpenInspect, cf *cfclient.Client, up cfclient.WorkerUpload) error {
+	err := cf.UploadWorker(ctx, up)
+	if err != nil && len(up.NewSqliteClasses) > 0 && cfclient.IsDOClassExists(err) {
+		up.NewSqliteClasses = nil
+		if err = cf.UploadWorker(ctx, up); err == nil {
+			r.Recorder.Eventf(oi, corev1.EventTypeNormal, "DOClassesAdopted",
+				"adopted existing durable object classes on %s", up.ScriptName)
+		}
+	}
+	return err
 }
 
 func (r *OpenInspectReconciler) scriptContent(ctx context.Context, namespace string, w openinspectv1alpha1.WorkerSpec) ([]byte, error) {
@@ -446,19 +583,150 @@ func (r *OpenInspectReconciler) scriptContent(ctx context.Context, namespace str
 	}
 }
 
+func (r *OpenInspectReconciler) cleanupProviderSandboxes(
+	ctx context.Context,
+	oi *openinspectv1alpha1.OpenInspect,
+	cf *cfclient.Client,
+) error {
+	sb := oi.Spec.Sandbox
+	if sb == nil {
+		return nil
+	}
+	switch sb.Provider {
+	case providerModal:
+		return r.cleanupModalProvider(ctx, oi, sb.Modal)
+	case providerDaytona:
+		return r.cleanupDaytonaProvider(ctx, oi, cf, sb.Daytona)
+	default:
+		return nil
+	}
+}
+
+func (r *OpenInspectReconciler) cleanupModalProvider(
+	ctx context.Context,
+	oi *openinspectv1alpha1.OpenInspect,
+	m *openinspectv1alpha1.ModalSandboxSpec,
+) error {
+	if m == nil {
+		return nil
+	}
+	// The provider calls act on the whole Modal app. Another live CR pointing
+	// at the same workspace and environment still depends on its sandbox pool.
+	user, err := r.sharedModalApp(ctx, oi)
+	if err != nil {
+		return err
+	}
+	if user != "" {
+		r.Recorder.Eventf(oi, corev1.EventTypeNormal, "ModalCleanupSkipped",
+			"modal app still in use by OpenInspect %s; leaving it running", user)
+		return nil
+	}
+
+	tokenID, err := r.secretValue(ctx, oi.Namespace, m.TokenIDSecretRef)
+	if err != nil {
+		r.Recorder.Eventf(oi, corev1.EventTypeWarning, "CredentialsUnavailable",
+			"cannot clean up modal resources: %v (set deletionPolicy: Orphan to skip)", err)
+		return err
+	}
+	tokenSecret, err := r.secretValue(ctx, oi.Namespace, m.TokenSecretSecretRef)
+	if err != nil {
+		r.Recorder.Eventf(oi, corev1.EventTypeWarning, "CredentialsUnavailable",
+			"cannot clean up modal resources: %v (set deletionPolicy: Orphan to skip)", err)
+		return err
+	}
+	cleanup := cleanupModalApp
+	if r.ModalCleanup != nil {
+		cleanup = r.ModalCleanup
+	}
+	terminated, appFound, err := cleanup(ctx, m, tokenID, tokenSecret)
+	if err != nil {
+		r.Recorder.Eventf(oi, corev1.EventTypeWarning, "ModalCleanupFailed", "%v", err)
+		return err
+	}
+	if !appFound {
+		// Not necessarily clean: the runtime addresses the app via web-suffix
+		// URLs, so a wrong spec.environment NAME looks exactly like "no app".
+		// Say what was (not) done instead of claiming a stop that never ran.
+		r.Recorder.Eventf(oi, corev1.EventTypeWarning, "ModalAppNotFound",
+			"no %q app in Modal environment %q; nothing cleaned — if the app lives elsewhere, verify spec.sandbox.modal.environment matches the deployed Modal environment name",
+			modalAppName, modalEnvironment(m))
+		return nil
+	}
+	if terminated > 0 {
+		r.Recorder.Eventf(oi, corev1.EventTypeNormal, "ModalSandboxesTerminated",
+			"terminated %d running sandboxes", terminated)
+	}
+	r.Recorder.Event(oi, corev1.EventTypeNormal, "ModalAppStopped", "modal app deployment stopped")
+	return nil
+}
+
+func (r *OpenInspectReconciler) cleanupDaytonaProvider(
+	ctx context.Context,
+	oi *openinspectv1alpha1.OpenInspect,
+	cf *cfclient.Client,
+	d *openinspectv1alpha1.DaytonaSandboxSpec,
+) error {
+	if d == nil || oi.Status.D1DatabaseID == "" {
+		return nil
+	}
+	sessionIDs, found, err := cf.D1SessionIDs(ctx, oi.Status.D1DatabaseID)
+	if err != nil {
+		r.Recorder.Eventf(oi, corev1.EventTypeWarning, "DaytonaOwnershipReadFailed",
+			"%v (set deletionPolicy: Orphan to skip)", err)
+		return err
+	}
+	if !found {
+		// Database or sessions table gone: no ownership evidence can ever
+		// exist, so a sweep is impossible — degrade instead of wedging the
+		// finalizer on the CR's own missing database.
+		r.Recorder.Event(oi, corev1.EventTypeWarning, "DaytonaSweepSkipped",
+			"no session ownership evidence in D1 (database or sessions table missing); leaving sandboxes to their auto-stop interval")
+		return nil
+	}
+	owned := make(map[string]struct{}, len(sessionIDs))
+	for _, id := range sessionIDs {
+		owned[id] = struct{}{}
+	}
+	apiKey, err := r.secretValue(ctx, oi.Namespace, d.APIKeySecretRef)
+	if err != nil {
+		r.Recorder.Eventf(oi, corev1.EventTypeWarning, "CredentialsUnavailable",
+			"cannot clean up daytona resources: %v (set deletionPolicy: Orphan to skip)", err)
+		return err
+	}
+	cleanup := sweepDaytonaSandboxes
+	if r.DaytonaCleanup != nil {
+		cleanup = r.DaytonaCleanup
+	}
+	deleted, err := cleanup(ctx, d, apiKey, owned)
+	if err != nil {
+		r.Recorder.Eventf(oi, corev1.EventTypeWarning, "DaytonaCleanupFailed", "%v", err)
+		return err
+	}
+	if deleted > 0 {
+		r.Recorder.Eventf(oi, corev1.EventTypeNormal, "DaytonaSandboxesDeleted",
+			"deleted %d owned sandboxes", deleted)
+	}
+	return nil
+}
+
 func (r *OpenInspectReconciler) reconcileDelete(ctx context.Context, oi *openinspectv1alpha1.OpenInspect) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(oi, finalizer) {
 		return ctrl.Result{}, nil
 	}
 	if oi.Spec.DeletionPolicy != "Orphan" {
 		// Credentials are only needed on this branch; Orphan must finalize
-		// even when the token Secret is already gone.
+		// even when the token Secret is already gone. Daytona ownership is
+		// read from D1 before that database is deleted below.
 		cf, err := r.cloudflareClient(ctx, oi)
 		if err != nil {
 			r.Recorder.Eventf(oi, corev1.EventTypeWarning, "CredentialsUnavailable",
-				"cannot delete Cloudflare resources: %v (set deletionPolicy: Orphan to skip)", err)
+				"cannot delete external resources: %v (set deletionPolicy: Orphan to skip)", err)
 			return ctrl.Result{}, err
 		}
+
+		// Workers die first so no new sessions (and thus no new provider
+		// sandboxes) can be created while the sweep below snapshots the D1
+		// session index as its ownership evidence.
 		for _, st := range oi.Status.Workers {
 			if st.ScriptName == "" {
 				continue
@@ -467,20 +735,33 @@ func (r *OpenInspectReconciler) reconcileDelete(ctx context.Context, oi *openins
 				return ctrl.Result{}, err
 			}
 		}
+
+		// Provider cleanup precedes the rest of the Cloudflare teardown
+		// because Daytona reads the CR-owned D1 session index.
+		if err := r.cleanupProviderSandboxes(ctx, oi, cf); err != nil {
+			return ctrl.Result{}, err
+		}
+
 		for _, id := range oi.Status.KVNamespaceIDs {
 			if err := cf.DeleteKV(ctx, id); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
-		if oi.Status.D1DatabaseID != "" {
-			if err := cf.DeleteD1(ctx, oi.Status.D1DatabaseID); err != nil {
+		for _, full := range oi.Status.R2Buckets {
+			// Without emptyBucketsOnDelete a non-empty bucket fails deletion;
+			// the error surfaces and deletion retries until resolved.
+			if err := r.deleteR2Bucket(ctx, oi, cf, full); err != nil {
+				r.Recorder.Eventf(oi, corev1.EventTypeWarning, "R2BucketDeletionBlocked",
+					"%v (set spec.emptyBucketsOnDelete to purge objects first)", err)
 				return ctrl.Result{}, err
 			}
 		}
-		for _, full := range oi.Status.R2Buckets {
-			// ponytail: a non-empty bucket fails deletion; we surface the
-			// error and keep retrying. Add object purge if that bites.
-			if err := cf.DeleteR2(ctx, full); err != nil {
+		// D1 goes LAST: it is the Daytona sweep's ownership evidence, and a
+		// retry after any later failure must still be able to read it (the
+		// sweep also tolerates a vanished database, but ordering keeps the
+		// evidence alive for the normal path).
+		if oi.Status.D1DatabaseID != "" {
+			if err := cf.DeleteD1(ctx, oi.Status.D1DatabaseID); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
@@ -489,12 +770,25 @@ func (r *OpenInspectReconciler) reconcileDelete(ctx context.Context, oi *openins
 	if err := r.Update(ctx, oi); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	readyGauge.DeleteLabelValues(oi.Namespace, oi.Name)
 	return ctrl.Result{}, nil
+}
+
+// conflictError marks adoption refusals so failed() reports them under the
+// ResourceConflict reason instead of the area's generic failure reason.
+type conflictError struct{ error }
+
+func conflictf(format string, args ...any) error {
+	return conflictError{fmt.Errorf(format, args...)}
 }
 
 // failed records the failing condition plus Ready=False and persists status.
 // The error is returned for controller-runtime backoff.
 func (r *OpenInspectReconciler) failed(ctx context.Context, oi *openinspectv1alpha1.OpenInspect, condition, reason string, err error) (ctrl.Result, error) {
+	var conflict conflictError
+	if errors.As(err, &conflict) {
+		reason = "ResourceConflict"
+	}
 	r.setCondition(oi, condition, metav1.ConditionFalse, reason, err.Error())
 	if condition != openinspectv1alpha1.ConditionReady {
 		r.setCondition(oi, openinspectv1alpha1.ConditionReady, metav1.ConditionFalse, reason, err.Error())
@@ -507,6 +801,13 @@ func (r *OpenInspectReconciler) failed(ctx context.Context, oi *openinspectv1alp
 }
 
 func (r *OpenInspectReconciler) setCondition(oi *openinspectv1alpha1.OpenInspect, t string, status metav1.ConditionStatus, reason, message string) {
+	if t == openinspectv1alpha1.ConditionReady {
+		v := 0.0
+		if status == metav1.ConditionTrue {
+			v = 1
+		}
+		readyGauge.WithLabelValues(oi.Namespace, oi.Name).Set(v)
+	}
 	meta.SetStatusCondition(&oi.Status.Conditions, metav1.Condition{
 		Type:               t,
 		Status:             status,
@@ -524,7 +825,9 @@ func (r *OpenInspectReconciler) persistStatus(ctx context.Context, oi *openinspe
 	status := oi.Status
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &openinspectv1alpha1.OpenInspect{}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(oi), latest); err != nil {
+		// Live read: rebasing the status write onto a cached object would
+		// reintroduce the stale-clobber this function exists to prevent.
+		if err := r.liveReader().Get(ctx, client.ObjectKeyFromObject(oi), latest); err != nil {
 			return client.IgnoreNotFound(err)
 		}
 		latest.Status = status
@@ -549,7 +852,7 @@ func (r *OpenInspectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
 		// The new events API (GetEventRecorder) has an incompatible
 		// interface; stay on the classic recorder until kubebuilder moves.
-		r.Recorder = mgr.GetEventRecorderFor("openinspect-operator") //nolint:staticcheck
+		r.Recorder = mgr.GetEventRecorderFor("openinspect-operator")
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		// Generation-gated so our own status writes never re-trigger.

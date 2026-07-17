@@ -27,7 +27,7 @@ func (r *OpenInspectReconciler) ensureWeb(ctx context.Context, oi *openinspectv1
 			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: oi.Namespace}},
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: oi.Namespace}},
 		} {
-			if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
+			if err := r.deleteOwned(ctx, oi, obj); err != nil {
 				return fmt.Errorf("remove web %T: %w", obj, err)
 			}
 		}
@@ -67,11 +67,45 @@ func (r *OpenInspectReconciler) ensureWeb(ctx context.Context, oi *openinspectv1
 		deploy.Spec.Replicas = web.Replicas
 		deploy.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		deploy.Spec.Template.Labels = labels
+		runAsNonRoot, runAsUser := true, int64(1000)
+		noPrivEsc, roRootFS := false, true
+		deploy.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
+			RunAsNonRoot:   &runAsNonRoot,
+			RunAsUser:      &runAsUser,
+			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		}
+		// The read-only root filesystem needs a writable /tmp for typical web
+		// runtimes (Next.js et al.).
+		deploy.Spec.Template.Spec.Volumes = []corev1.Volume{{
+			Name:         "tmp",
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		}}
+		// TCP, not HTTP GET /: the image is arbitrary and its root path may
+		// 404, require auth, or not speak HTTP at all — an HTTP liveness
+		// probe would restart-loop such a container. A listening socket is
+		// the only universally safe signal.
+		probe := &corev1.Probe{
+			ProbeHandler: corev1.ProbeHandler{
+				TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(port)},
+			},
+		}
 		deploy.Spec.Template.Spec.Containers = []corev1.Container{{
 			Name:  "web",
 			Image: web.Image,
 			Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: port}},
 			Env:   env,
+			SecurityContext: &corev1.SecurityContext{
+				AllowPrivilegeEscalation: &noPrivEsc,
+				ReadOnlyRootFilesystem:   &roRootFS,
+				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			},
+			VolumeMounts:   []corev1.VolumeMount{{Name: "tmp", MountPath: "/tmp"}},
+			ReadinessProbe: probe,
+			LivenessProbe: &corev1.Probe{
+				ProbeHandler:     probe.ProbeHandler,
+				FailureThreshold: 6,
+				PeriodSeconds:    20,
+			},
 		}}
 		return ctrl.SetControllerReference(oi, deploy, r.Scheme)
 	})
@@ -96,6 +130,18 @@ func (r *OpenInspectReconciler) ensureWeb(ctx context.Context, oi *openinspectv1
 	r.setCondition(oi, openinspectv1alpha1.ConditionWeb, metav1.ConditionTrue, "Reconciled",
 		fmt.Sprintf("web deployment applied, %d replicas ready", ready))
 	return nil
+}
+
+// deleteOwned removes obj only if this CR is its controller owner, so a name
+// collision with an unrelated object is never destructive.
+func (r *OpenInspectReconciler) deleteOwned(ctx context.Context, oi *openinspectv1alpha1.OpenInspect, obj client.Object) error {
+	if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(obj, oi) {
+		return nil
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, obj))
 }
 
 func sortedKeys(m map[string]string) []string {

@@ -4,24 +4,39 @@ run:
 linters:
   default: none
   enable:
+    - bodyclose
     - copyloopvar
     - dupl
+    - durationcheck
     - errcheck
+    - errname
+    - errorlint
     - ginkgolinter
+    - gocheckcompilerdirectives
     - goconst
+    - gocritic
     - gocyclo
+    - gosec
     - govet
     - ineffassign
     - lll
+    - makezero
     - modernize
     - misspell
     - nakedret
+    - nilerr
+    - nolintlint
     - prealloc
+    - predeclared
+    - reassign
     - revive
     - staticcheck
     - unconvert
     - unparam
     - unused
+    - usestdlibvars
+    - wastedassign
+    - whitespace
   settings:
     revive:
       rules:
@@ -30,6 +45,9 @@ linters:
     modernize:
       disable:
         - omitzero
+    nolintlint:
+      require-explanation: true
+      require-specific: true
   exclusions:
     generated: lax
     rules:
@@ -40,6 +58,16 @@ linters:
           - dupl
           - lll
         path: internal/*
+      - linters:
+          - dupl
+          - goconst
+        path: _test\.go
+      # e2e helpers shell out to trusted developer tooling (kubectl, make,
+      # docker) by design; gosec's subprocess/credential heuristics do not
+      # apply there.
+      - linters:
+          - gosec
+        path: ^test/
     paths:
       - third_party$
       - builtin$

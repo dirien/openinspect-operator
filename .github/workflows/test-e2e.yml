@@ -2,7 +2,11 @@ name: E2E Tests
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   test-e2e:
@@ -10,10 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
-        uses: actions/checkout@v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
 
@@ -30,3 +34,16 @@ jobs:
         run: |
           go mod tidy
           make test-e2e
+
+      # Failure-only diagnostics: cost nothing on green runs, save a
+      # debug-commit cycle on red ones.
+      - name: Dump operator state
+        if: failure()
+        run: |
+          kubectl get deployments,pods -n openinspect-operator-system -o wide || true
+          kubectl describe pods -n openinspect-operator-system || true
+          kubectl get events -n openinspect-operator-system --sort-by=.lastTimestamp | tail -50 || true
+
+      - name: Dump operator logs
+        if: failure()
+        run: kubectl logs -n openinspect-operator-system -l control-plane=controller-manager --tail=-1 || true

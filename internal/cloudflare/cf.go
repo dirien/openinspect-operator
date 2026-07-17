@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"regexp"
 	"sort"
 	"strings"
@@ -40,7 +41,7 @@ func New(accountID, apiToken, baseURL string) *Client {
 func isNotFound(err error) bool {
 	var apierr *cf.Error
 	if errors.As(err, &apierr) {
-		return apierr.StatusCode == 404
+		return apierr.StatusCode == http.StatusNotFound
 	}
 	return false
 }
@@ -51,31 +52,32 @@ func isNotFound(err error) bool {
 const maxListItems = 100000
 
 // EnsureD1 returns the ID of the database with the given name, creating it if
-// missing.
-func (c *Client) EnsureD1(ctx context.Context, name string) (string, error) {
+// missing. created reports whether this call created it, so the caller can
+// distinguish adoption of a foreign database from normal reconciliation.
+func (c *Client) EnsureD1(ctx context.Context, name string) (id string, created bool, err error) {
 	iter := c.api.D1.Database.ListAutoPaging(ctx, d1.DatabaseListParams{
 		AccountID: cf.F(c.AccountID),
 		Name:      cf.F(name),
 	})
 	for n := 0; iter.Next(); n++ {
 		if n > maxListItems {
-			return "", fmt.Errorf("list d1 databases: pagination never terminated")
+			return "", false, fmt.Errorf("list d1 databases: pagination never terminated")
 		}
 		if db := iter.Current(); db.Name == name {
-			return db.UUID, nil
+			return db.UUID, false, nil
 		}
 	}
 	if err := iter.Err(); err != nil {
-		return "", fmt.Errorf("list d1 databases: %w", err)
+		return "", false, fmt.Errorf("list d1 databases: %w", err)
 	}
 	db, err := c.api.D1.Database.New(ctx, d1.DatabaseNewParams{
 		AccountID: cf.F(c.AccountID),
 		Name:      cf.F(name),
 	})
 	if err != nil {
-		return "", fmt.Errorf("create d1 database %q: %w", name, err)
+		return "", false, fmt.Errorf("create d1 database %q: %w", name, err)
 	}
-	return db.UUID, nil
+	return db.UUID, true, nil
 }
 
 // DeleteD1 removes the database, tolerating absence.
@@ -102,6 +104,35 @@ func (c *Client) d1Query(ctx context.Context, databaseID, sql string) ([]any, er
 		rows = append(rows, res.Results...)
 	}
 	return rows, nil
+}
+
+// D1SessionIDs returns the session IDs recorded by this Open-Inspect
+// deployment. Provider finalizers use these IDs as ownership evidence for
+// sandboxes created dynamically by the control-plane worker. found is false
+// when the evidence cannot exist — database gone or sessions table never
+// created — so deletion can degrade to a skipped sweep instead of wedging
+// the finalizer on its own missing database.
+func (c *Client) D1SessionIDs(ctx context.Context, databaseID string) (ids []string, found bool, err error) {
+	rows, err := c.d1Query(ctx, databaseID, "SELECT id FROM sessions ORDER BY id")
+	if err != nil {
+		if isNotFound(err) || strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read session IDs from d1: %w", err)
+	}
+	ids = make([]string, 0, len(rows))
+	for _, row := range rows {
+		values, ok := row.(map[string]any)
+		if !ok {
+			return nil, false, fmt.Errorf("read session IDs from d1: unexpected row type %T", row)
+		}
+		id, ok := values["id"].(string)
+		if !ok || id == "" {
+			return nil, false, fmt.Errorf("read session IDs from d1: row has no string id")
+		}
+		ids = append(ids, id)
+	}
+	return ids, true, nil
 }
 
 var migrationPrefix = regexp.MustCompile(`^\d+`)
@@ -166,23 +197,28 @@ func (c *Client) ApplyMigrations(ctx context.Context, databaseID string, files m
 	return len(applied), nil
 }
 
-// EnsureKV returns the namespace ID for the given title, creating it if
-// missing.
-func (c *Client) EnsureKV(ctx context.Context, title string) (string, error) {
+// ListKVTitles returns title -> namespace ID for the whole account: one paged
+// list per reconcile instead of one per namespace.
+func (c *Client) ListKVTitles(ctx context.Context) (map[string]string, error) {
+	titles := map[string]string{}
 	iter := c.api.KV.Namespaces.ListAutoPaging(ctx, kv.NamespaceListParams{
 		AccountID: cf.F(c.AccountID),
 	})
 	for n := 0; iter.Next(); n++ {
 		if n > maxListItems {
-			return "", fmt.Errorf("list kv namespaces: pagination never terminated")
+			return nil, fmt.Errorf("list kv namespaces: pagination never terminated")
 		}
-		if ns := iter.Current(); ns.Title == title {
-			return ns.ID, nil
-		}
+		ns := iter.Current()
+		titles[ns.Title] = ns.ID
 	}
 	if err := iter.Err(); err != nil {
-		return "", fmt.Errorf("list kv namespaces: %w", err)
+		return nil, fmt.Errorf("list kv namespaces: %w", err)
 	}
+	return titles, nil
+}
+
+// CreateKV creates the namespace and returns its ID.
+func (c *Client) CreateKV(ctx context.Context, title string) (string, error) {
 	ns, err := c.api.KV.Namespaces.New(ctx, kv.NamespaceNewParams{
 		AccountID: cf.F(c.AccountID),
 		Title:     cf.F(title),
@@ -204,23 +240,24 @@ func (c *Client) DeleteKV(ctx context.Context, namespaceID string) error {
 	return nil
 }
 
-// EnsureR2 creates the bucket if missing.
-func (c *Client) EnsureR2(ctx context.Context, name string) error {
-	_, err := c.api.R2.Buckets.Get(ctx, name, r2.BucketGetParams{AccountID: cf.F(c.AccountID)})
+// EnsureR2 creates the bucket if missing. created reports whether this call
+// created it.
+func (c *Client) EnsureR2(ctx context.Context, name string) (created bool, err error) {
+	_, err = c.api.R2.Buckets.Get(ctx, name, r2.BucketGetParams{AccountID: cf.F(c.AccountID)})
 	if err == nil {
-		return nil
+		return false, nil
 	}
 	if !isNotFound(err) {
-		return fmt.Errorf("get r2 bucket %q: %w", name, err)
+		return false, fmt.Errorf("get r2 bucket %q: %w", name, err)
 	}
 	_, err = c.api.R2.Buckets.New(ctx, r2.BucketNewParams{
 		AccountID: cf.F(c.AccountID),
 		Name:      cf.F(name),
 	})
 	if err != nil {
-		return fmt.Errorf("create r2 bucket %q: %w", name, err)
+		return false, fmt.Errorf("create r2 bucket %q: %w", name, err)
 	}
-	return nil
+	return true, nil
 }
 
 // DeleteR2 removes the bucket, tolerating absence. A non-empty bucket cannot
@@ -231,6 +268,42 @@ func (c *Client) DeleteR2(ctx context.Context, name string) error {
 		return fmt.Errorf("delete r2 bucket %q: %w", name, err)
 	}
 	return nil
+}
+
+// PurgeR2 deletes every object in the bucket so DeleteR2 can succeed.
+// Tolerates an absent bucket. Returns the number of objects deleted.
+func (c *Client) PurgeR2(ctx context.Context, name string) (int, error) {
+	deleted := 0
+	for {
+		iter := c.api.R2.Buckets.Objects.ListAutoPaging(ctx, name, r2.BucketObjectListParams{
+			AccountID: cf.F(c.AccountID),
+		})
+		var keys []string
+		for n := 0; iter.Next(); n++ {
+			if n > maxListItems {
+				return deleted, fmt.Errorf("purge r2 bucket %q: pagination never terminated", name)
+			}
+			keys = append(keys, iter.Current().Key)
+		}
+		if err := iter.Err(); err != nil {
+			if isNotFound(err) {
+				return deleted, nil
+			}
+			return deleted, fmt.Errorf("list objects in r2 bucket %q: %w", name, err)
+		}
+		if len(keys) == 0 {
+			return deleted, nil
+		}
+		for _, key := range keys {
+			_, err := c.api.R2.Buckets.Objects.Delete(ctx, name, key, r2.BucketObjectDeleteParams{
+				AccountID: cf.F(c.AccountID),
+			})
+			if err != nil && !isNotFound(err) {
+				return deleted, fmt.Errorf("delete object %q from r2 bucket %q: %w", key, name, err)
+			}
+			deleted++
+		}
+	}
 }
 
 // ListWorkerNames returns the script names that exist on the account.
@@ -307,6 +380,17 @@ func (c *Client) SetCron(ctx context.Context, scriptName string, crons []string)
 	return nil
 }
 
+// AccountSubdomain returns the account's workers.dev subdomain name.
+func (c *Client) AccountSubdomain(ctx context.Context) (string, error) {
+	res, err := c.api.Workers.Subdomains.Get(ctx, workers.SubdomainGetParams{
+		AccountID: cf.F(c.AccountID),
+	})
+	if err != nil {
+		return "", fmt.Errorf("get workers.dev subdomain: %w", err)
+	}
+	return res.Subdomain, nil
+}
+
 // EnableSubdomain exposes the script on the workers.dev subdomain.
 func (c *Client) EnableSubdomain(ctx context.Context, scriptName string) error {
 	_, err := c.api.Workers.Scripts.Subdomain.New(ctx, scriptName, workers.ScriptSubdomainNewParams{
@@ -319,7 +403,23 @@ func (c *Client) EnableSubdomain(ctx context.Context, scriptName string) error {
 	return nil
 }
 
-// DeleteWorker removes the script, tolerating absence.
+// IsDOClassExists reports Cloudflare error 10074: a new-class migration
+// naming a Durable Object class that already has live objects.
+func IsDOClassExists(err error) bool {
+	var apierr *cf.Error
+	if errors.As(err, &apierr) {
+		for _, e := range apierr.Errors {
+			if e.Code == 10074 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// DeleteWorker removes the script, tolerating absence. Force also removes
+// the script's Durable Object namespaces and their storage — the same
+// semantics wrangler and the Terraform provider rely on.
 func (c *Client) DeleteWorker(ctx context.Context, scriptName string) error {
 	_, err := c.api.Workers.Scripts.Delete(ctx, scriptName, workers.ScriptDeleteParams{
 		AccountID: cf.F(c.AccountID),

@@ -26,7 +26,7 @@ func sandboxInjection(sb *openinspectv1alpha1.SandboxSpec) (vars map[string]stri
 	}
 
 	switch sb.Provider {
-	case "modal":
+	case providerModal:
 		m := sb.Modal
 		set("MODAL_WORKSPACE", m.Workspace)
 		set("MODAL_ENVIRONMENT", m.Environment)
@@ -71,11 +71,7 @@ func applySandbox(oi *openinspectv1alpha1.OpenInspect, w openinspectv1alpha1.Wor
 	if sb == nil {
 		return w
 	}
-	target := sb.ControlPlaneWorker
-	if target == "" {
-		target = "control-plane"
-	}
-	if w.Name != target {
+	if w.Name != controlPlaneWorkerName(oi) {
 		return w
 	}
 
@@ -130,7 +126,7 @@ func validateSandbox(sb *openinspectv1alpha1.SandboxSpec, workers map[string]boo
 		field   string
 		present bool
 	}{
-		"modal":        {"modal", sb.Modal != nil},
+		providerModal:  {providerModal, sb.Modal != nil},
 		"daytona":      {"daytona", sb.Daytona != nil},
 		"vercel":       {"vercel", sb.Vercel != nil},
 		"opencomputer": {"openComputer", sb.OpenComputer != nil},
@@ -138,10 +134,19 @@ func validateSandbox(sb *openinspectv1alpha1.SandboxSpec, workers map[string]boo
 	if !sections[sb.Provider].present {
 		return fmt.Errorf("sandbox.provider is %q but spec.sandbox.%s is not set", sb.Provider, sections[sb.Provider].field)
 	}
-	for _, name := range []string{"modal", "daytona", "vercel", "opencomputer"} {
+	for _, name := range []string{providerModal, "daytona", "vercel", "opencomputer"} {
 		if s := sections[name]; s.present && name != sb.Provider {
 			return fmt.Errorf("sandbox.%s is set but provider is %q", s.field, sb.Provider)
 		}
+	}
+	// Deletion cleanup resolves the Modal app by environment NAME while the
+	// runtime only uses the web SUFFIX in URLs — a suffix on the defaulted
+	// "main" environment works at runtime but makes cleanup look in the wrong
+	// environment (silently leaking the real app, or stopping a stranger's).
+	if m := sb.Modal; m != nil && m.EnvironmentWebSuffix != "" &&
+		modalEnvironment(m) == "main" && m.EnvironmentWebSuffix != "main" {
+		return fmt.Errorf("sandbox.modal.environmentWebSuffix %q is set while environment is %q: set spec.sandbox.modal.environment to the Modal environment name the app is deployed in",
+			m.EnvironmentWebSuffix, modalEnvironment(m))
 	}
 	return nil
 }

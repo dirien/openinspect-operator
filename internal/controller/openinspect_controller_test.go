@@ -17,12 +17,14 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -64,6 +66,8 @@ var _ = Describe("OpenInspect Controller", func() {
 	var (
 		mock       *httptest.Server
 		reconciler *OpenInspectReconciler
+		sweepCalls int
+		stopCalls  int
 	)
 
 	reconcile := func() error {
@@ -71,13 +75,46 @@ var _ = Describe("OpenInspect Controller", func() {
 		return err
 	}
 
+	// modalSpec is a minimal valid spec with a Modal sandbox, parameterized on
+	// the api-secret ref so tests can point it at a deletable secret.
+	modalSpec := func(deploymentName string, apiRef openinspectv1alpha1.SecretKeyRef) openinspectv1alpha1.OpenInspectSpec {
+		return openinspectv1alpha1.OpenInspectSpec{
+			DeploymentName: deploymentName,
+			Cloudflare: openinspectv1alpha1.CloudflareSpec{
+				AccountID:         "acc-123",
+				APITokenSecretRef: openinspectv1alpha1.SecretKeyRef{Name: "cf-creds", Key: "apiToken"},
+				APIBaseURL:        mock.URL,
+			},
+			Workers: []openinspectv1alpha1.WorkerSpec{{
+				Name:   "control-plane",
+				Script: openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
+			}},
+			Sandbox: &openinspectv1alpha1.SandboxSpec{
+				Provider: "modal",
+				Modal: &openinspectv1alpha1.ModalSandboxSpec{
+					Workspace:            "dirien",
+					TokenIDSecretRef:     openinspectv1alpha1.SecretKeyRef{Name: "cp-secrets", Key: "modalTokenId"},
+					TokenSecretSecretRef: openinspectv1alpha1.SecretKeyRef{Name: "cp-secrets", Key: "modalTokenSecret"},
+					APISecretSecretRef:   apiRef,
+				},
+			},
+		}
+	}
+
 	BeforeEach(func() {
 		mock = httptest.NewServer(cfmock.New().Handler())
 		DeferCleanup(mock.Close)
+		sweepCalls = 0
+		stopCalls = 0
 		reconciler = &OpenInspectReconciler{
 			Client:   k8sClient,
 			Scheme:   scheme.Scheme,
 			Recorder: record.NewFakeRecorder(100),
+			ModalCleanup: func(context.Context, *openinspectv1alpha1.ModalSandboxSpec, string, string) (int, bool, error) {
+				sweepCalls++
+				stopCalls++
+				return 2, true, nil
+			},
 		}
 
 		objs := []client.Object{
@@ -214,11 +251,17 @@ var _ = Describe("OpenInspect Controller", func() {
 		Expect(cp).To(ContainSubstring(`"* * * * *"`))
 		Expect(cp).To(ContainSubstring(`"subdomain":true`))
 
-		By("web UI deployed in-cluster with owner reference")
+		By("web UI deployed in-cluster with owner reference, hardened, and probed")
 		deploy := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-web", Namespace: ns}, deploy)).To(Succeed())
 		Expect(deploy.Spec.Template.Spec.Containers[0].Image).To(Equal("ghcr.io/example/web:v1"))
 		Expect(deploy.OwnerReferences).NotTo(BeEmpty())
+		Expect(deploy.Spec.Template.Spec.SecurityContext.RunAsNonRoot).To(HaveValue(BeTrue()))
+		webC := deploy.Spec.Template.Spec.Containers[0]
+		Expect(webC.SecurityContext.ReadOnlyRootFilesystem).To(HaveValue(BeTrue()))
+		Expect(webC.SecurityContext.Capabilities.Drop).To(ContainElement(corev1.Capability("ALL")))
+		Expect(webC.ReadinessProbe.TCPSocket).NotTo(BeNil(), "probes must be TCP: arbitrary images may not serve HTTP 200 on /")
+		Expect(webC.LivenessProbe.TCPSocket).NotTo(BeNil())
 		svc := &corev1.Service{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-web", Namespace: ns}, svc)).To(Succeed())
 
@@ -261,6 +304,8 @@ var _ = Describe("OpenInspect Controller", func() {
 		By("deletion cleans up all Cloudflare resources")
 		Expect(k8sClient.Delete(ctx, fetched)).To(Succeed())
 		Expect(reconcile()).To(Succeed())
+		Expect(sweepCalls).To(Equal(1), "deletion must sweep running Modal sandboxes")
+		Expect(stopCalls).To(Equal(1), "deletion must stop the CR's Modal app deployment")
 		st = fetchState(mock.URL)
 		Expect(st.Result.D1).To(BeEmpty())
 		Expect(st.Result.KV).To(BeEmpty())
@@ -374,6 +419,158 @@ var _ = Describe("OpenInspect Controller", func() {
 		Expect(reconciler.mapReferencing(referencesConfigMap)(ctx, unrelated)).To(BeEmpty())
 	})
 
+	It("refuses a younger CR that claims the same deploymentName", func() {
+		spec := openinspectv1alpha1.OpenInspectSpec{
+			DeploymentName: "claim",
+			Cloudflare: openinspectv1alpha1.CloudflareSpec{
+				AccountID:         "acc-123",
+				APITokenSecretRef: openinspectv1alpha1.SecretKeyRef{Name: "cf-creds", Key: "apiToken"},
+				APIBaseURL:        mock.URL,
+			},
+			KVNamespaces: []string{"one"},
+		}
+		a := &openinspectv1alpha1.OpenInspect{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Spec: spec}
+		b := &openinspectv1alpha1.OpenInspect{ObjectMeta: metav1.ObjectMeta{Name: name + "-b", Namespace: ns}, Spec: spec}
+		for _, oi := range []*openinspectv1alpha1.OpenInspect{a, b} {
+			Expect(k8sClient.Create(ctx, oi)).To(Succeed())
+			DeferCleanup(func() {
+				latest := &openinspectv1alpha1.OpenInspect{}
+				if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(oi), latest); err == nil {
+					latest.Finalizers = nil
+					_ = k8sClient.Update(ctx, latest)
+					_ = k8sClient.Delete(ctx, latest)
+				}
+			})
+		}
+
+		Expect(reconcile()).To(Succeed(), "the older claimant must reconcile")
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(b)})
+		Expect(err).To(HaveOccurred(), "the younger claimant must be refused")
+
+		fetched := &openinspectv1alpha1.OpenInspect{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(b), fetched)).To(Succeed())
+		ready := meta.FindStatusCondition(fetched.Status.Conditions, openinspectv1alpha1.ConditionReady)
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.Reason).To(Equal("DeploymentNameConflict"))
+		Expect(fetchState(mock.URL).Result.KV).To(HaveLen(1), "the refused CR must not touch remote state")
+
+		Expect(reconcile()).To(Succeed(), "the older claimant must stay unaffected")
+	})
+
+	It("refuses pre-existing remote resources until adoptExisting is set", func() {
+		spec := openinspectv1alpha1.OpenInspectSpec{
+			DeploymentName: "takeover",
+			DeletionPolicy: "Orphan",
+			Cloudflare: openinspectv1alpha1.CloudflareSpec{
+				AccountID:         "acc-123",
+				APITokenSecretRef: openinspectv1alpha1.SecretKeyRef{Name: "cf-creds", Key: "apiToken"},
+				APIBaseURL:        mock.URL,
+			},
+			D1:           &openinspectv1alpha1.D1Spec{},
+			KVNamespaces: []string{"cache"},
+			R2Buckets:    []string{"media"},
+			Workers: []openinspectv1alpha1.WorkerSpec{{
+				Name:   "control-plane",
+				Script: openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
+			}},
+		}
+
+		By("first CR creates everything, then orphans it on delete")
+		first := &openinspectv1alpha1.OpenInspect{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Spec: spec}
+		Expect(k8sClient.Create(ctx, first)).To(Succeed())
+		Expect(reconcile()).To(Succeed())
+		Expect(k8sClient.Get(ctx, key, first)).To(Succeed())
+		origID := first.Status.D1DatabaseID
+		Expect(origID).NotTo(BeEmpty())
+		Expect(k8sClient.Delete(ctx, first)).To(Succeed())
+		Expect(reconcile()).To(Succeed())
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, &openinspectv1alpha1.OpenInspect{}))).To(BeTrue())
+		Expect(fetchState(mock.URL).Result.D1).NotTo(BeEmpty(), "orphaned resources must survive")
+
+		By("recreated CR conflicts instead of silently capturing the orphans")
+		second := &openinspectv1alpha1.OpenInspect{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Spec: spec}
+		second.Spec.DeletionPolicy = ""
+		Expect(k8sClient.Create(ctx, second)).To(Succeed())
+		DeferCleanup(func() {
+			latest := &openinspectv1alpha1.OpenInspect{}
+			if err := k8sClient.Get(ctx, key, latest); err == nil {
+				latest.Finalizers = nil
+				_ = k8sClient.Update(ctx, latest)
+				_ = k8sClient.Delete(ctx, latest)
+			}
+		})
+		Expect(reconcile()).To(HaveOccurred())
+		fetched := &openinspectv1alpha1.OpenInspect{}
+		Expect(k8sClient.Get(ctx, key, fetched)).To(Succeed())
+		ready := meta.FindStatusCondition(fetched.Status.Conditions, openinspectv1alpha1.ConditionReady)
+		Expect(ready).NotTo(BeNil())
+		Expect(ready.Reason).To(Equal("ResourceConflict"))
+
+		By("adoptExisting takes over the orphans instead of recreating them")
+		Expect(k8sClient.Get(ctx, key, fetched)).To(Succeed())
+		fetched.Spec.AdoptExisting = true
+		Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+		Expect(reconcile()).To(Succeed())
+		Expect(k8sClient.Get(ctx, key, fetched)).To(Succeed())
+		Expect(fetched.Status.D1DatabaseID).To(Equal(origID), "adoption must keep the original database")
+		Expect(fetched.Status.Workers["control-plane"].AppliedHash).NotTo(BeEmpty())
+		ready = meta.FindStatusCondition(fetched.Status.Conditions, openinspectv1alpha1.ConditionReady)
+		Expect(ready.Status).To(Equal(metav1.ConditionTrue))
+		st := fetchState(mock.URL)
+		Expect(st.Result.D1).To(HaveLen(1))
+		Expect(st.Result.Workers).To(HaveLen(1))
+	})
+
+	It("blocks deletion on a non-empty bucket unless emptyBucketsOnDelete purges it", func() {
+		oi := &openinspectv1alpha1.OpenInspect{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: openinspectv1alpha1.OpenInspectSpec{
+				DeploymentName: "purge",
+				Cloudflare: openinspectv1alpha1.CloudflareSpec{
+					AccountID:         "acc-123",
+					APITokenSecretRef: openinspectv1alpha1.SecretKeyRef{Name: "cf-creds", Key: "apiToken"},
+					APIBaseURL:        mock.URL,
+				},
+				R2Buckets: []string{"media"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, oi)).To(Succeed())
+		DeferCleanup(func() {
+			latest := &openinspectv1alpha1.OpenInspect{}
+			if err := k8sClient.Get(ctx, key, latest); err == nil {
+				latest.Finalizers = nil
+				_ = k8sClient.Update(ctx, latest)
+				_ = k8sClient.Delete(ctx, latest)
+			}
+		})
+		Expect(reconcile()).To(Succeed())
+		Expect(fetchState(mock.URL).Result.R2).To(HaveKey("open-inspect-media-purge"))
+
+		By("seeding an object into the bucket")
+		req, err := http.NewRequest(http.MethodPut,
+			mock.URL+"/accounts/acc-123/r2/buckets/open-inspect-media-purge/objects/sessions/img.png", nil)
+		Expect(err).NotTo(HaveOccurred())
+		req.Header.Set("Authorization", "Bearer x")
+		resp, err := http.DefaultClient.Do(req)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(resp.StatusCode).To(Equal(200))
+		_ = resp.Body.Close()
+
+		By("deletion blocks while the bucket is non-empty")
+		Expect(k8sClient.Delete(ctx, oi)).To(Succeed())
+		Expect(reconcile()).NotTo(Succeed(), "non-empty bucket must block deletion without the flag")
+		Expect(fetchState(mock.URL).Result.R2).To(HaveKey("open-inspect-media-purge"))
+
+		By("setting emptyBucketsOnDelete unblocks deletion")
+		latest := &openinspectv1alpha1.OpenInspect{}
+		Expect(k8sClient.Get(ctx, key, latest)).To(Succeed())
+		latest.Spec.EmptyBucketsOnDelete = true
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		Expect(reconcile()).To(Succeed())
+		Expect(fetchState(mock.URL).Result.R2).NotTo(HaveKey("open-inspect-media-purge"))
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, &openinspectv1alpha1.OpenInspect{}))).To(BeTrue())
+	})
+
 	It("orphans Cloudflare resources with deletionPolicy Orphan", func() {
 		oi := &openinspectv1alpha1.OpenInspect{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
@@ -396,5 +593,201 @@ var _ = Describe("OpenInspect Controller", func() {
 		Expect(reconcile()).To(Succeed())
 		Expect(fetchState(mock.URL).Result.KV).To(ContainElement("open-inspect-cache-orphan"),
 			"orphan policy must keep remote resources")
+	})
+
+	It("suspends reconciliation and scales web to zero", func() {
+		oi := &openinspectv1alpha1.OpenInspect{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec: openinspectv1alpha1.OpenInspectSpec{
+				DeploymentName: "suspend",
+				Cloudflare: openinspectv1alpha1.CloudflareSpec{
+					AccountID:         "acc-123",
+					APITokenSecretRef: openinspectv1alpha1.SecretKeyRef{Name: "cf-creds", Key: "apiToken"},
+					APIBaseURL:        mock.URL,
+				},
+				KVNamespaces: []string{"cache"},
+				Web:          &openinspectv1alpha1.WebSpec{Image: "ghcr.io/example/web:v1"},
+			},
+		}
+		Expect(k8sClient.Create(ctx, oi)).To(Succeed())
+		DeferCleanup(func() {
+			latest := &openinspectv1alpha1.OpenInspect{}
+			if err := k8sClient.Get(ctx, key, latest); err == nil {
+				latest.Finalizers = nil
+				_ = k8sClient.Update(ctx, latest)
+				_ = k8sClient.Delete(ctx, latest)
+			}
+		})
+		Expect(reconcile()).To(Succeed())
+		Expect(testutil.ToFloat64(readyGauge.WithLabelValues(ns, name))).To(Equal(1.0))
+
+		By("suspending scales web to zero and stops reconciling")
+		fetched := &openinspectv1alpha1.OpenInspect{}
+		Expect(k8sClient.Get(ctx, key, fetched)).To(Succeed())
+		fetched.Spec.Suspended = true
+		Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+		Expect(reconcile()).To(Succeed())
+		deploy := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-web", Namespace: ns}, deploy)).To(Succeed())
+		Expect(deploy.Spec.Replicas).To(HaveValue(BeEquivalentTo(0)))
+		Expect(k8sClient.Get(ctx, key, fetched)).To(Succeed())
+		ready := meta.FindStatusCondition(fetched.Status.Conditions, openinspectv1alpha1.ConditionReady)
+		Expect(ready.Reason).To(Equal("Suspended"))
+		Expect(testutil.ToFloat64(readyGauge.WithLabelValues(ns, name))).To(Equal(0.0))
+
+		By("spec edits cause no remote mutation while suspended")
+		Expect(k8sClient.Get(ctx, key, fetched)).To(Succeed())
+		fetched.Spec.KVNamespaces = nil
+		Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+		Expect(reconcile()).To(Succeed())
+		Expect(fetchState(mock.URL).Result.KV).To(ContainElement("open-inspect-cache-suspend"),
+			"suspension must block pruning")
+
+		By("resuming restores web and applies the pending prune")
+		Expect(k8sClient.Get(ctx, key, fetched)).To(Succeed())
+		fetched.Spec.Suspended = false
+		Expect(k8sClient.Update(ctx, fetched)).To(Succeed())
+		Expect(reconcile()).To(Succeed())
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: name + "-web", Namespace: ns}, deploy)).To(Succeed())
+		Expect(deploy.Spec.Replicas).To(HaveValue(BeEquivalentTo(1)))
+		Expect(fetchState(mock.URL).Result.KV).To(BeEmpty())
+		Expect(testutil.ToFloat64(readyGauge.WithLabelValues(ns, name))).To(Equal(1.0))
+	})
+
+	It("never touches an unrelated deployment with the web name", func() {
+		// Own CR name: envtest has no GC, so the suspend test's owned
+		// <name>-web deployment lingers and would collide.
+		byName := name + "-by"
+		byKey := types.NamespacedName{Name: byName, Namespace: ns}
+		bystander := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: byName + "-web", Namespace: ns},
+			Spec: appsv1.DeploymentSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "bystander"}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "bystander"}},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{{Name: "app", Image: "nginx"}},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, bystander)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, bystander) })
+
+		oi := &openinspectv1alpha1.OpenInspect{
+			ObjectMeta: metav1.ObjectMeta{Name: byName, Namespace: ns},
+			Spec: openinspectv1alpha1.OpenInspectSpec{
+				DeploymentName: "bystander",
+				Cloudflare: openinspectv1alpha1.CloudflareSpec{
+					AccountID:         "acc-123",
+					APITokenSecretRef: openinspectv1alpha1.SecretKeyRef{Name: "cf-creds", Key: "apiToken"},
+					APIBaseURL:        mock.URL,
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, oi)).To(Succeed())
+		DeferCleanup(func() {
+			latest := &openinspectv1alpha1.OpenInspect{}
+			if err := k8sClient.Get(ctx, byKey, latest); err == nil {
+				latest.Finalizers = nil
+				_ = k8sClient.Update(ctx, latest)
+				_ = k8sClient.Delete(ctx, latest)
+			}
+		})
+		reconcileBy := func() error {
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: byKey})
+			return err
+		}
+
+		By("a normal pass (spec.web nil) must not delete it")
+		Expect(reconcileBy()).To(Succeed())
+		fetched := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(bystander), fetched)).To(Succeed())
+
+		By("a suspended pass must not scale it")
+		latest := &openinspectv1alpha1.OpenInspect{}
+		Expect(k8sClient.Get(ctx, byKey, latest)).To(Succeed())
+		latest.Spec.Suspended = true
+		Expect(k8sClient.Update(ctx, latest)).To(Succeed())
+		Expect(reconcileBy()).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(bystander), fetched)).To(Succeed())
+		Expect(fetched.Spec.Replicas).To(HaveValue(BeEquivalentTo(1)), "unowned deployment must keep its replicas")
+	})
+
+	It("leaves a shared Modal app running until its last CR is deleted", func() {
+		apiRef := openinspectv1alpha1.SecretKeyRef{Name: "cp-secrets", Key: "modalApiSecret"}
+		a := &openinspectv1alpha1.OpenInspect{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}, Spec: modalSpec("shared-a", apiRef)}
+		b := &openinspectv1alpha1.OpenInspect{ObjectMeta: metav1.ObjectMeta{Name: name + "-b", Namespace: ns}, Spec: modalSpec("shared-b", apiRef)}
+		for _, oi := range []*openinspectv1alpha1.OpenInspect{a, b} {
+			Expect(k8sClient.Create(ctx, oi)).To(Succeed())
+			DeferCleanup(func() {
+				latest := &openinspectv1alpha1.OpenInspect{}
+				if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(oi), latest); err == nil {
+					latest.Finalizers = nil
+					_ = k8sClient.Update(ctx, latest)
+					_ = k8sClient.Delete(ctx, latest)
+				}
+			})
+			_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(oi)})
+			Expect(err).NotTo(HaveOccurred())
+		}
+
+		By("deleting the first CR must not touch the shared app")
+		Expect(k8sClient.Delete(ctx, a)).To(Succeed())
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(a)})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(a), &openinspectv1alpha1.OpenInspect{}))).To(BeTrue())
+		Expect(sweepCalls).To(BeZero(), "shared sandbox pool must not be swept")
+		Expect(stopCalls).To(BeZero(), "shared modal app must not be stopped")
+
+		By("deleting the last CR stops the app")
+		Expect(k8sClient.Delete(ctx, b)).To(Succeed())
+		_, err = reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(b)})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sweepCalls).To(Equal(1))
+		Expect(stopCalls).To(Equal(1))
+	})
+
+	It("blocks deletion while the Modal token secret is missing", func() {
+		sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "cp-secrets", Namespace: ns}}
+		oi := &openinspectv1alpha1.OpenInspect{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       modalSpec("modal-creds", openinspectv1alpha1.SecretKeyRef{Name: "cp-secrets", Key: "modalApiSecret"}),
+		}
+		Expect(k8sClient.Create(ctx, oi)).To(Succeed())
+		DeferCleanup(func() {
+			latest := &openinspectv1alpha1.OpenInspect{}
+			if err := k8sClient.Get(ctx, key, latest); err == nil {
+				latest.Finalizers = nil
+				_ = k8sClient.Update(ctx, latest)
+				_ = k8sClient.Delete(ctx, latest)
+			}
+		})
+		Expect(reconcile()).To(Succeed())
+
+		By("deletion blocks while the secret is gone")
+		Expect(k8sClient.Delete(ctx, sec)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, oi)).To(Succeed())
+		Expect(reconcile()).NotTo(Succeed(), "missing modal credentials must block deletion")
+		fetched := &openinspectv1alpha1.OpenInspect{}
+		Expect(k8sClient.Get(ctx, key, fetched)).To(Succeed())
+		Expect(fetched.Finalizers).To(ContainElement(finalizer))
+		Expect(stopCalls).To(BeZero(), "the app must not be stopped without credentials")
+
+		By("restoring the secret unblocks deletion")
+		sec = &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "cp-secrets", Namespace: ns},
+			StringData: map[string]string{
+				"githubClientSecret": "gh-hunter2",
+				"modalTokenId":       "ak-test-id",
+				"modalTokenSecret":   "as-test-secret",
+				"modalApiSecret":     "modal-api-hunter2",
+			},
+		}
+		Expect(k8sClient.Create(ctx, sec)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, sec) })
+		Expect(reconcile()).To(Succeed())
+		Expect(stopCalls).To(Equal(1))
+		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, key, &openinspectv1alpha1.OpenInspect{}))).To(BeTrue())
 	})
 })

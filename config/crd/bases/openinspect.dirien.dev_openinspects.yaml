@@ -56,6 +56,51 @@ spec:
               OpenInspectSpec defines the desired state of one full deployment of the
               open-inspect platform: all Cloudflare resources plus the in-cluster web UI.
             properties:
+              adoptExisting:
+                description: |-
+                  AdoptExisting lets this CR take ownership of Cloudflare resources that
+                  already exist under its names (e.g. recreated after a deletionPolicy:
+                  Orphan delete). Off by default so one CR can never silently capture
+                  resources created by another deployment or tool.
+                type: boolean
+              appSecrets:
+                description: |-
+                  AppSecrets seeds the platform's global secrets store (the
+                  control-plane worker's /secrets API, injected into sandboxes at
+                  creation) from Kubernetes Secrets after each worker deploy. Keys
+                  removed from this list are deleted from the store; keys added out of
+                  band (e.g. via the web UI) are left alone.
+                items:
+                  description: |-
+                    AppSecret maps one global secret key in the platform's secrets store to
+                    the Kubernetes Secret value that backs it. Keys are uppercase because the
+                    upstream store uppercases every key on write; admitting other spellings
+                    would make spec keys never match the store's listing.
+                  properties:
+                    key:
+                      pattern: ^[A-Z_][A-Z0-9_]*$
+                      type: string
+                    secretRef:
+                      description: SecretKeyRef selects a key of a Secret in the same
+                        namespace.
+                      properties:
+                        key:
+                          type: string
+                        name:
+                          type: string
+                      required:
+                      - key
+                      - name
+                      type: object
+                  required:
+                  - key
+                  - secretRef
+                  type: object
+                maxItems: 50
+                type: array
+                x-kubernetes-list-map-keys:
+                - key
+                x-kubernetes-list-type: map
               cloudflare:
                 description: CloudflareSpec holds account credentials and API endpoint.
                 properties:
@@ -100,8 +145,11 @@ spec:
               deletionPolicy:
                 default: Delete
                 description: |-
-                  DeletionPolicy controls whether Cloudflare resources are deleted or
-                  orphaned when the CR is deleted.
+                  DeletionPolicy controls whether external resources are deleted or
+                  orphaned when the CR is deleted. Orphan skips ALL external cleanup:
+                  besides Cloudflare resources it also leaves running sandbox-provider
+                  compute behind (Modal sandboxes and the deployed Modal app, Daytona
+                  sandboxes) with nothing left that will ever stop it.
                 enum:
                 - Delete
                 - Orphan
@@ -115,6 +163,13 @@ spec:
                 x-kubernetes-validations:
                 - message: deploymentName is immutable
                   rule: self == oldSelf
+              emptyBucketsOnDelete:
+                description: |-
+                  EmptyBucketsOnDelete purges all objects from R2 buckets before deleting
+                  them (on CR deletion and when a bucket is removed from spec). Without
+                  it, Cloudflare refuses to delete non-empty buckets: CR deletion blocks
+                  and pruned buckets are orphaned with a warning event.
+                type: boolean
               kvNamespaces:
                 description: |-
                   KVNamespaces are logical names; the Cloudflare title becomes
@@ -122,16 +177,21 @@ spec:
                 items:
                   pattern: ^[a-z0-9][a-z0-9-]*$
                   type: string
+                maxItems: 100
                 type: array
               namePrefix:
                 default: open-inspect
                 pattern: ^[a-z0-9][a-z0-9-]*$
                 type: string
+                x-kubernetes-validations:
+                - message: namePrefix is immutable
+                  rule: self == oldSelf
               r2Buckets:
                 description: R2Buckets are logical names, expanded like KV namespaces.
                 items:
                   pattern: ^[a-z0-9][a-z0-9-]*$
                   type: string
+                maxItems: 100
                 type: array
               sandbox:
                 description: |-
@@ -163,7 +223,9 @@ spec:
                       apiUrl:
                         description: |-
                           APIURL of the Daytona API (e.g. https://app.daytona.io/api); the
-                          upstream control plane requires it.
+                          upstream control plane requires it, and deletion refuses to sweep
+                          against an SDK fallback URL.
+                        minLength: 1
                         type: string
                       baseSnapshot:
                         description: |-
@@ -202,8 +264,17 @@ spec:
                         type: object
                       environment:
                         default: main
+                        description: |-
+                          Environment is the Modal environment NAME the app is deployed in.
+                          Deletion cleanup resolves the app by this name, so it must match the
+                          environment used with `modal deploy` even when environmentWebSuffix
+                          carries the URL suffix.
                         type: string
                       environmentWebSuffix:
+                        description: |-
+                          EnvironmentWebSuffix overrides the suffix embedded in the app's
+                          *.modal.run URLs when it differs from the environment name. It never
+                          selects the environment itself — set environment for that.
                         type: string
                       tokenIdSecretRef:
                         description: SecretKeyRef selects a key of a Secret in the
@@ -328,6 +399,13 @@ spec:
                 required:
                 - provider
                 type: object
+              suspended:
+                description: |-
+                  Suspended pauses reconciliation: no Cloudflare calls, no pruning, and
+                  the web Deployment is scaled to zero. Nothing is deleted; setting it
+                  back to false resumes where things left off. Deletion still finalizes
+                  normally while suspended.
+                type: boolean
               web:
                 description: WebSpec runs the web UI inside the cluster as a Deployment
                   + Service.
@@ -336,6 +414,7 @@ spec:
                     additionalProperties:
                       type: string
                     description: Env are plain environment variables.
+                    maxProperties: 128
                     type: object
                   image:
                     description: Image is the container image of the web app.
@@ -377,6 +456,7 @@ spec:
                       - binding
                       - secretRef
                       type: object
+                    maxItems: 64
                     type: array
                 required:
                 - image
@@ -386,8 +466,9 @@ spec:
                   description: WorkerSpec describes one Cloudflare Worker.
                   properties:
                     bindings:
-                      description: WorkerBindings groups all binding kinds for one
-                        worker.
+                      description: |-
+                        WorkerBindings groups all binding kinds for one worker. The per-list caps
+                        stay within Cloudflare's own limit of 64 bindings per worker.
                       properties:
                         d1:
                           items:
@@ -400,6 +481,7 @@ spec:
                             required:
                             - binding
                             type: object
+                          maxItems: 64
                           type: array
                         durableObjects:
                           items:
@@ -414,6 +496,7 @@ spec:
                             - binding
                             - className
                             type: object
+                          maxItems: 64
                           type: array
                         kv:
                           items:
@@ -428,6 +511,7 @@ spec:
                             - binding
                             - namespace
                             type: object
+                          maxItems: 64
                           type: array
                         r2:
                           items:
@@ -442,6 +526,7 @@ spec:
                             - binding
                             - bucket
                             type: object
+                          maxItems: 64
                           type: array
                         services:
                           items:
@@ -460,6 +545,7 @@ spec:
                             - binding
                             - worker
                             type: object
+                          maxItems: 64
                           type: array
                       type: object
                     compatibilityDate:
@@ -468,11 +554,13 @@ spec:
                     compatibilityFlags:
                       items:
                         type: string
+                      maxItems: 32
                       type: array
                     cron:
                       description: Cron schedules for the worker (e.g. "* * * * *").
                       items:
                         type: string
+                      maxItems: 10
                       type: array
                     name:
                       description: |-
@@ -530,16 +618,19 @@ spec:
                         - binding
                         - secretRef
                         type: object
+                      maxItems: 64
                       type: array
                     vars:
                       additionalProperties:
                         type: string
                       description: Vars become plain_text bindings (environment variables).
+                      maxProperties: 128
                       type: object
                   required:
                   - name
                   - script
                   type: object
+                maxItems: 100
                 type: array
                 x-kubernetes-list-map-keys:
                 - name
@@ -551,6 +642,23 @@ spec:
           status:
             description: OpenInspectStatus defines the observed state of OpenInspect.
             properties:
+              appSecrets:
+                description: |-
+                  AppSecrets records what was last seeded into the platform's global
+                  secrets store, so removed keys can be deleted and unchanged values
+                  skip the round-trip.
+                properties:
+                  appliedHash:
+                    description: AppliedHash is the hash of the last seeded key/value
+                      set.
+                    type: string
+                  keys:
+                    description: Keys are the store keys this CR manages; used to
+                      prune removed ones.
+                    items:
+                      type: string
+                    type: array
+                type: object
               appliedMigrations:
                 description: AppliedMigrations is the number of migrations recorded
                   as applied.
@@ -611,6 +719,9 @@ spec:
                   - type
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
               d1DatabaseId:
                 description: D1DatabaseID is the UUID of the created database.
                 type: string

@@ -6,6 +6,8 @@ cliVersion: 4.11.1
 domain: dirien.dev
 layout:
 - go.kubebuilder.io/v4
+plugins:
+  helm.kubebuilder.io/v1-alpha: {}
 projectName: openinspect-operator
 repo: github.com/dirien/openinspect-operator
 resources:

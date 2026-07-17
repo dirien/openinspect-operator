@@ -1,0 +1,11 @@
+# Release image built by GoReleaser: the manager binary is prebuilt by the
+# builds section of .goreleaser.yaml, placed in the context under
+# $TARGETPLATFORM/ (dockers_v2 layout). The plain Dockerfile stays for
+# dev/CI builds from source (make docker-build).
+FROM gcr.io/distroless/static:nonroot
+ARG TARGETPLATFORM
+WORKDIR /
+COPY ${TARGETPLATFORM}/manager .
+USER 65532:65532
+
+ENTRYPOINT ["/manager"]

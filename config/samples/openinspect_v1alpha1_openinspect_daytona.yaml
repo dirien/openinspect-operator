@@ -1,0 +1,90 @@
+apiVersion: openinspect.dirien.dev/v1alpha1
+kind: OpenInspect
+metadata:
+  labels:
+    app.kubernetes.io/name: openinspect-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: openinspect-daytona
+  namespace: open-inspect-daytona
+spec:
+  deploymentName: daytona
+  cloudflare:
+    accountId: "3a5b62f8408d9e488350c993fddcb04a"
+    apiTokenSecretRef: {name: cloudflare-credentials, key: apiToken}
+  d1:
+    migrationsConfigMapRef: d1-migrations
+  kvNamespaces: [session-index]
+  r2Buckets: [media]
+  workers:
+    - name: control-plane
+      script:
+        configMapRef: {name: worker-bundles, key: control-plane.js.gz}
+      compatibilityDate: "2024-09-23"
+      compatibilityFlags: [nodejs_compat]
+      bindings:
+        d1: [{binding: DB}]
+        kv: [{binding: REPOS_CACHE, namespace: session-index}]
+        r2: [{binding: MEDIA_BUCKET, bucket: media}]
+        durableObjects:
+          - {binding: SESSION, className: SessionDO}
+          - {binding: SCHEDULER, className: SchedulerDO}
+      vars:
+        APP_NAME: Open Inspect
+        DEPLOYMENT_NAME: daytona
+        GITHUB_CLIENT_ID: Iv23litA098xiR1uQwZ5
+        WEB_APP_URL: http://localhost:3000
+        WORKER_URL: https://open-inspect-control-plane-daytona.engin-diri.workers.dev
+      secrets:
+        - binding: GITHUB_CLIENT_SECRET
+          secretRef: {name: platform-secrets, key: githubClientSecret}
+        - binding: TOKEN_ENCRYPTION_KEY
+          secretRef: {name: platform-secrets, key: tokenEncryptionKey}
+        - binding: REPO_SECRETS_ENCRYPTION_KEY
+          secretRef: {name: platform-secrets, key: repoSecretsEncryptionKey}
+        - binding: INTERNAL_CALLBACK_SECRET
+          secretRef: {name: platform-secrets, key: internalCallbackSecret}
+        - binding: GITHUB_APP_ID
+          secretRef: {name: platform-secrets, key: githubAppId}
+        - binding: GITHUB_APP_PRIVATE_KEY
+          secretRef: {name: platform-secrets, key: githubAppPrivateKey}
+        - binding: GITHUB_APP_INSTALLATION_ID
+          secretRef: {name: platform-secrets, key: githubAppInstallationId}
+      cron: ["* * * * *"]
+  # AppSecrets seeds the platform's global secrets store (Settings->Secrets
+  # in the web UI); sandboxes receive these as env vars at creation.
+  appSecrets:
+    - key: ANTHROPIC_API_KEY
+      secretRef: {name: platform-secrets, key: anthropicApiKey}
+  # The operator injects SANDBOX_PROVIDER=daytona, DAYTONA_API_URL,
+  # DAYTONA_BASE_SNAPSHOT, DAYTONA_TARGET (if set) and the DAYTONA_API_KEY
+  # secret binding into the control-plane worker. On CR deletion the operator
+  # deletes only the Daytona sandboxes whose session labels match this
+  # deployment's D1 session index; the base snapshot is never touched.
+  sandbox:
+    provider: daytona
+    daytona:
+      # Prebuilt snapshot with the sandbox runtime; build it once with
+      # upstream packages/daytona-infra before applying this CR.
+      baseSnapshot: open-inspect-base
+      apiUrl: https://app.daytona.io/api
+      # target: us
+      apiKeySecretRef: {name: platform-secrets, key: daytonaApiKey}
+  web:
+    image: open-inspect-web:daytona
+    replicas: 1
+    port: 3000
+    env:
+      CONTROL_PLANE_URL: https://open-inspect-control-plane-daytona.engin-diri.workers.dev
+      NEXTAUTH_URL: http://localhost:3000
+      GITHUB_CLIENT_ID: Iv23litA098xiR1uQwZ5
+      ALLOWED_USERS: dirien
+    secretEnv:
+      - binding: NEXTAUTH_SECRET
+        secretRef: {name: platform-secrets, key: nextauthSecret}
+      - binding: GITHUB_CLIENT_SECRET
+        secretRef: {name: platform-secrets, key: githubClientSecret}
+      - binding: INTERNAL_CALLBACK_SECRET
+        secretRef: {name: platform-secrets, key: internalCallbackSecret}
+      - binding: ANTHROPIC_API_KEY
+        secretRef: {name: platform-secrets, key: anthropicApiKey}
+  deletionPolicy: Delete

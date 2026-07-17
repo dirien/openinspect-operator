@@ -23,11 +23,12 @@ import (
 // Condition types surfaced in status.conditions. Reasons on these conditions
 // are machine API: renaming one is a breaking change.
 const (
-	ConditionReady   = "Ready"
-	ConditionD1      = "D1Ready"
-	ConditionStorage = "StorageReady"
-	ConditionWorkers = "WorkersReady"
-	ConditionWeb     = "WebReady"
+	ConditionReady      = "Ready"
+	ConditionD1         = "D1Ready"
+	ConditionStorage    = "StorageReady"
+	ConditionWorkers    = "WorkersReady"
+	ConditionWeb        = "WebReady"
+	ConditionAppSecrets = "AppSecretsReady"
 )
 
 // SecretKeyRef selects a key of a Secret in the same namespace.
@@ -102,16 +103,22 @@ type ServiceBinding struct {
 	Worker string `json:"worker"`
 }
 
-// WorkerBindings groups all binding kinds for one worker.
+// WorkerBindings groups all binding kinds for one worker. The per-list caps
+// stay within Cloudflare's own limit of 64 bindings per worker.
 type WorkerBindings struct {
+	// +kubebuilder:validation:MaxItems=64
 	// +optional
 	D1 []D1Binding `json:"d1,omitempty"`
+	// +kubebuilder:validation:MaxItems=64
 	// +optional
 	KV []KVBinding `json:"kv,omitempty"`
+	// +kubebuilder:validation:MaxItems=64
 	// +optional
 	R2 []R2Binding `json:"r2,omitempty"`
+	// +kubebuilder:validation:MaxItems=64
 	// +optional
 	DurableObjects []DurableObjectBinding `json:"durableObjects,omitempty"`
+	// +kubebuilder:validation:MaxItems=64
 	// +optional
 	Services []ServiceBinding `json:"services,omitempty"`
 }
@@ -125,6 +132,16 @@ type ScriptSource struct {
 	// +kubebuilder:validation:MaxLength=2048
 	// +optional
 	URL string `json:"url,omitempty"`
+}
+
+// AppSecret maps one global secret key in the platform's secrets store to
+// the Kubernetes Secret value that backs it. Keys are uppercase because the
+// upstream store uppercases every key on write; admitting other spellings
+// would make spec keys never match the store's listing.
+type AppSecret struct {
+	// +kubebuilder:validation:Pattern=`^[A-Z_][A-Z0-9_]*$`
+	Key       string       `json:"key"`
+	SecretRef SecretKeyRef `json:"secretRef"`
 }
 
 // WorkerSecret maps a Kubernetes Secret key to a secret binding / env var.
@@ -146,6 +163,7 @@ type WorkerSpec struct {
 	// +kubebuilder:default="2024-12-30"
 	// +optional
 	CompatibilityDate string `json:"compatibilityDate,omitempty"`
+	// +kubebuilder:validation:MaxItems=32
 	// +optional
 	CompatibilityFlags []string `json:"compatibilityFlags,omitempty"`
 
@@ -153,14 +171,17 @@ type WorkerSpec struct {
 	Bindings WorkerBindings `json:"bindings,omitempty"`
 
 	// Vars become plain_text bindings (environment variables).
+	// +kubebuilder:validation:MaxProperties=128
 	// +optional
 	Vars map[string]string `json:"vars,omitempty"`
 
 	// Secrets become secret_text bindings, values read from Secrets.
+	// +kubebuilder:validation:MaxItems=64
 	// +optional
 	Secrets []WorkerSecret `json:"secrets,omitempty"`
 
 	// Cron schedules for the worker (e.g. "* * * * *").
+	// +kubebuilder:validation:MaxItems=10
 	// +optional
 	Cron []string `json:"cron,omitempty"`
 }
@@ -170,9 +191,16 @@ type WorkerSpec struct {
 // wires the control plane to it.
 type ModalSandboxSpec struct {
 	Workspace string `json:"workspace"`
+	// Environment is the Modal environment NAME the app is deployed in.
+	// Deletion cleanup resolves the app by this name, so it must match the
+	// environment used with `modal deploy` even when environmentWebSuffix
+	// carries the URL suffix.
 	// +kubebuilder:default="main"
 	// +optional
 	Environment string `json:"environment,omitempty"`
+	// EnvironmentWebSuffix overrides the suffix embedded in the app's
+	// *.modal.run URLs when it differs from the environment name. It never
+	// selects the environment itself — set environment for that.
 	// +optional
 	EnvironmentWebSuffix string `json:"environmentWebSuffix,omitempty"`
 
@@ -187,7 +215,9 @@ type DaytonaSandboxSpec struct {
 	// sandbox runtime.
 	BaseSnapshot string `json:"baseSnapshot"`
 	// APIURL of the Daytona API (e.g. https://app.daytona.io/api); the
-	// upstream control plane requires it.
+	// upstream control plane requires it, and deletion refuses to sweep
+	// against an SDK fallback URL.
+	// +kubebuilder:validation:MinLength=1
 	APIURL string `json:"apiUrl"`
 	// +optional
 	Target string `json:"target,omitempty"`
@@ -277,10 +307,12 @@ type WebSpec struct {
 	Port int32 `json:"port,omitempty"`
 
 	// Env are plain environment variables.
+	// +kubebuilder:validation:MaxProperties=128
 	// +optional
 	Env map[string]string `json:"env,omitempty"`
 
 	// SecretEnv injects environment variables from Secret keys.
+	// +kubebuilder:validation:MaxItems=64
 	// +optional
 	SecretEnv []WorkerSecret `json:"secretEnv,omitempty"`
 }
@@ -295,9 +327,17 @@ type OpenInspectSpec struct {
 	DeploymentName string `json:"deploymentName"`
 
 	// +kubebuilder:default="open-inspect"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="namePrefix is immutable"
 	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
 	// +optional
 	NamePrefix string `json:"namePrefix,omitempty"`
+
+	// AdoptExisting lets this CR take ownership of Cloudflare resources that
+	// already exist under its names (e.g. recreated after a deletionPolicy:
+	// Orphan delete). Off by default so one CR can never silently capture
+	// resources created by another deployment or tool.
+	// +optional
+	AdoptExisting bool `json:"adoptExisting,omitempty"`
 
 	Cloudflare CloudflareSpec `json:"cloudflare"`
 
@@ -307,16 +347,19 @@ type OpenInspectSpec struct {
 	// KVNamespaces are logical names; the Cloudflare title becomes
 	// <namePrefix>-<name>-<deploymentName>.
 	// +kubebuilder:validation:items:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxItems=100
 	// +optional
 	KVNamespaces []string `json:"kvNamespaces,omitempty"`
 
 	// R2Buckets are logical names, expanded like KV namespaces.
 	// +kubebuilder:validation:items:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxItems=100
 	// +optional
 	R2Buckets []string `json:"r2Buckets,omitempty"`
 
 	// +listType=map
 	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=100
 	// +optional
 	Workers []WorkerSpec `json:"workers,omitempty"`
 
@@ -328,12 +371,40 @@ type OpenInspectSpec struct {
 	// +optional
 	Web *WebSpec `json:"web,omitempty"`
 
-	// DeletionPolicy controls whether Cloudflare resources are deleted or
-	// orphaned when the CR is deleted.
+	// AppSecrets seeds the platform's global secrets store (the
+	// control-plane worker's /secrets API, injected into sandboxes at
+	// creation) from Kubernetes Secrets after each worker deploy. Keys
+	// removed from this list are deleted from the store; keys added out of
+	// band (e.g. via the web UI) are left alone.
+	// +listType=map
+	// +listMapKey=key
+	// +kubebuilder:validation:MaxItems=50
+	// +optional
+	AppSecrets []AppSecret `json:"appSecrets,omitempty"`
+
+	// DeletionPolicy controls whether external resources are deleted or
+	// orphaned when the CR is deleted. Orphan skips ALL external cleanup:
+	// besides Cloudflare resources it also leaves running sandbox-provider
+	// compute behind (Modal sandboxes and the deployed Modal app, Daytona
+	// sandboxes) with nothing left that will ever stop it.
 	// +kubebuilder:validation:Enum=Delete;Orphan
 	// +kubebuilder:default=Delete
 	// +optional
 	DeletionPolicy string `json:"deletionPolicy,omitempty"`
+
+	// EmptyBucketsOnDelete purges all objects from R2 buckets before deleting
+	// them (on CR deletion and when a bucket is removed from spec). Without
+	// it, Cloudflare refuses to delete non-empty buckets: CR deletion blocks
+	// and pruned buckets are orphaned with a warning event.
+	// +optional
+	EmptyBucketsOnDelete bool `json:"emptyBucketsOnDelete,omitempty"`
+
+	// Suspended pauses reconciliation: no Cloudflare calls, no pruning, and
+	// the web Deployment is scaled to zero. Nothing is deleted; setting it
+	// back to false resumes where things left off. Deletion still finalizes
+	// normally while suspended.
+	// +optional
+	Suspended bool `json:"suspended,omitempty"`
 }
 
 // WorkerStatus records what is live for one worker.
@@ -359,6 +430,8 @@ type OpenInspectStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
+	// +listType=map
+	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
@@ -382,6 +455,21 @@ type OpenInspectStatus struct {
 	// Workers maps logical worker names to their live state.
 	// +optional
 	Workers map[string]WorkerStatus `json:"workers,omitempty"`
+
+	// AppSecrets records what was last seeded into the platform's global
+	// secrets store, so removed keys can be deleted and unchanged values
+	// skip the round-trip.
+	// +optional
+	AppSecrets *AppSecretsStatus `json:"appSecrets,omitempty"`
+}
+
+// AppSecretsStatus records the last seeded global secrets.
+type AppSecretsStatus struct {
+	// AppliedHash is the hash of the last seeded key/value set.
+	AppliedHash string `json:"appliedHash,omitempty"`
+	// Keys are the store keys this CR manages; used to prune removed ones.
+	// +optional
+	Keys []string `json:"keys,omitempty"`
 }
 
 // +kubebuilder:object:root=true
@@ -414,11 +502,22 @@ func init() {
 	SchemeBuilder.Register(&OpenInspect{}, &OpenInspectList{})
 }
 
+// namePrefix returns spec.namePrefix with its default applied.
+func (o *OpenInspect) namePrefix() string {
+	if o.Spec.NamePrefix != "" {
+		return o.Spec.NamePrefix
+	}
+	return "open-inspect"
+}
+
 // ResourceName expands a logical name to the full Cloudflare resource name.
 func (o *OpenInspect) ResourceName(logical string) string {
-	prefix := o.Spec.NamePrefix
-	if prefix == "" {
-		prefix = "open-inspect"
-	}
-	return prefix + "-" + logical + "-" + o.Spec.DeploymentName
+	return o.namePrefix() + "-" + logical + "-" + o.Spec.DeploymentName
+}
+
+// ClaimKey identifies the account-level naming domain this CR occupies. Two
+// CRs with the same key would fight over the same Cloudflare resources, so
+// the reconciler refuses to run all but the oldest claimant.
+func (o *OpenInspect) ClaimKey() string {
+	return o.Spec.Cloudflare.AccountID + "|" + o.namePrefix() + "|" + o.Spec.DeploymentName
 }

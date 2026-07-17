@@ -43,6 +43,11 @@ func referencesSecret(oi *openinspectv1alpha1.OpenInspect, name string) bool {
 			}
 		}
 	}
+	for _, s := range oi.Spec.AppSecrets {
+		if s.SecretRef.Name == name {
+			return true
+		}
+	}
 	if sb := oi.Spec.Sandbox; sb != nil {
 		refs := []openinspectv1alpha1.SecretKeyRef{}
 		if sb.Modal != nil {

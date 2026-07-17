@@ -49,6 +49,26 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt" paths="./..."
 
+.PHONY: helm-sync
+helm-sync: manifests kubebuilder ## Resync dist/chart (CRDs, RBAC) from config/ via the kubebuilder helm plugin.
+	"$(KUBEBUILDER)" edit --plugins=helm/v1-alpha
+
+.PHONY: helm-docs
+helm-docs: helm-docs-bin ## Generate dist/chart/README.md from README.md.gotmpl.
+	"$(HELM_DOCS)" -c dist/chart -t README.md.gotmpl -o README.md
+
+.PHONY: release-snapshot
+release-snapshot: ## GoReleaser dry run (no publish)
+	goreleaser release --snapshot --clean
+
+.PHONY: check-generated
+check-generated: manifests generate helm-sync helm-docs ## Fail if committed generated files (config/, dist/chart) are stale.
+	@git diff --exit-code && test -z "$$(git status --porcelain)" || { \
+		git status --porcelain; \
+		echo "::error::Generated files are out of sync. Run 'make manifests generate helm-sync' and commit the result."; \
+		exit 1; \
+	}
+
 .PHONY: fmt
 fmt: ## Run go fmt against code.
 	go fmt ./...
@@ -190,6 +210,8 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+KUBEBUILDER ?= $(LOCALBIN)/kubebuilder
+HELM_DOCS ?= $(LOCALBIN)/helm-docs
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.7.1
@@ -206,6 +228,8 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
 GOLANGCI_LINT_VERSION ?= v2.7.2
+KUBEBUILDER_VERSION ?= v4.11.1
+HELM_DOCS_VERSION ?= v1.14.2
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
@@ -233,6 +257,16 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+.PHONY: kubebuilder
+kubebuilder: $(KUBEBUILDER) ## Download kubebuilder locally if necessary.
+$(KUBEBUILDER): $(LOCALBIN)
+	$(call go-install-tool,$(KUBEBUILDER),sigs.k8s.io/kubebuilder/v4,$(KUBEBUILDER_VERSION))
+
+.PHONY: helm-docs-bin
+helm-docs-bin: $(HELM_DOCS) ## Download helm-docs locally if necessary.
+$(HELM_DOCS): $(LOCALBIN)
+	$(call go-install-tool,$(HELM_DOCS),github.com/norwoodj/helm-docs/cmd/helm-docs,$(HELM_DOCS_VERSION))
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary

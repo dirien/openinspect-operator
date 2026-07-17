@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/dirien/openinspect-operator/internal/cfmock"
 )
@@ -15,5 +16,10 @@ func main() {
 		addr = ":8787"
 	}
 	log.Printf("cfmock listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, cfmock.New().Handler()))
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           cfmock.New().Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }

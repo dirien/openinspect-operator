@@ -19,7 +19,8 @@ apply`, 13 `null_resource` script shims, `scripts/d1-migrate.sh`, and
 | Durable Object migrations | `new_sqlite_classes` declared automatically on first upload of a worker |
 | Web UI | runs **in-cluster** as an owned Deployment + Service (env from spec, secrets via `secretKeyRef`) |
 | Sandbox providers | `spec.sandbox` selects **modal / daytona / vercel / opencomputer**; the operator injects that provider's vars and secret bindings into the control-plane worker (explicit worker values win) |
-| Deletion | finalizer removes all Cloudflare resources; `deletionPolicy: Orphan` keeps them |
+| Platform app secrets | `spec.appSecrets` seeds the platform's global secrets store (what sandboxes receive as env, e.g. `ANTHROPIC_API_KEY`) through the control-plane worker's own API — no web-UI clickops; removed keys are pruned, keys added via the UI are left alone, a wiped store re-seeds itself |
+| Deletion | finalizer removes all Cloudflare resources, terminates the CR's Modal sandboxes and **stops its Modal app** via Modal's Go SDK, and deletes the Daytona sandboxes whose labels match this CR's D1 session index — other installations' sandboxes are never touched; `deletionPolicy: Orphan` keeps everything, including running provider compute |
 
 Version uploads are gated by a content hash over script bytes, bindings,
 vars, and secret values — unchanged workers never churn new versions.
@@ -38,9 +39,23 @@ Cross-field mistakes (bindings referencing undefined namespaces/buckets/
 workers, duplicate worker names) are rejected as a terminal `InvalidSpec`
 condition instead of erroring against the Cloudflare API.
 
+Each CR is one complete installation, isolated per Modal *environment*
+(`spec.sandbox.modal.environment` names it; `environmentWebSuffix` only
+shapes the `*.modal.run` URLs, and a suffix on the defaulted `main`
+environment is rejected because deletion resolves the app by name). Deploying
+the Modal app into an environment is the one workspace-admin install step
+(`MODAL_ENVIRONMENT=<env> modal deploy` — Modal has no API for app
+deployment). Teardown needs no CLI: on CR deletion the operator terminates
+the app's sandboxes and stops the app through Modal's Go SDK, against a
+stock upstream deployment. Daytona cleanup is scoped by ownership evidence:
+the operator reads the session IDs from the CR's own D1 database and deletes
+only sandboxes carrying those session labels, so several installations can
+share one Daytona organization safely.
+
 Out of scope (not automatable via APIs): GitHub/Slack/Linear/Google app
-registrations, and Modal/Daytona/OpenComputer sandbox image builds (CLI- and
-script-driven upstream).
+registrations, Modal app *deployment* (see above), and
+Modal/Daytona/OpenComputer sandbox image builds (CLI- and script-driven
+upstream).
 
 ## Custom resource
 
@@ -75,16 +90,42 @@ spec:
       secrets:
         - {binding: GITHUB_CLIENT_SECRET, secretRef: {name: platform-secrets, key: githubClientSecret}}
       cron: ["* * * * *"]
+  appSecrets:                                # seeded into the platform's secrets store
+    - {key: ANTHROPIC_API_KEY, secretRef: {name: platform-secrets, key: anthropicApiKey}}
   web:
     image: ghcr.io/your-org/open-inspect-web:latest
 ```
 
 Cloudflare resource names expand to `<namePrefix>-<logical>-<deploymentName>`
 (prefix defaults to `open-inspect`), matching the upstream Terraform naming.
+Both parts are immutable.
 
 `kubectl get oi` shows Ready state, reason, and applied migration count.
 
-## Getting Started
+## Multi-tenancy
+
+The operator is built for platform teams offering open-inspect as a
+self-service on a shared cluster: many `OpenInspect` CRs, one operator.
+
+- **Credentials are per-CR.** Every CR references its own API token Secret in
+  its own namespace; there is no operator-level token. The recommended model
+  is one Cloudflare account per tenant — blast radius, billing, and the API
+  rate limit (per token) all shard along with it. A no-op reconcile pass
+  costs roughly a dozen API calls, so even hundreds of CRs per token stay far
+  below Cloudflare's 1200 requests/5 min limit.
+- **Names cannot collide.** If a younger CR claims the same
+  `accountId` + `namePrefix` + `deploymentName` as an existing one, it is
+  refused with a `DeploymentNameConflict` condition before any Cloudflare
+  call. The oldest claimant always wins, deterministically.
+- **Existing remote resources are never captured silently.** A CR that finds
+  a D1 database, KV namespace, R2 bucket, or worker script already existing
+  under one of its names — created by another tool, another cluster, or a
+  previously orphaned CR — stops with a `ResourceConflict` condition.
+  Setting `spec.adoptExisting: true` takes them over explicitly, which is
+  the intended way to resurrect a deployment after a `deletionPolicy:
+  Orphan` delete.
+
+## Getting started
 
 ### Prerequisites
 - go v1.25+
@@ -94,12 +135,23 @@ Cloudflare resource names expand to `<namePrefix>-<logical>-<deploymentName>`
 
 ### Deploy
 
+Via Helm (chart in `dist/chart`, CRD included and kept on uninstall):
+
+```sh
+make docker-build docker-push IMG=<registry>/openinspect-operator:tag
+helm install openinspect-operator dist/chart -n openinspect-operator-system --create-namespace \
+  --set controllerManager.container.image.repository=<registry>/openinspect-operator \
+  --set controllerManager.container.image.tag=tag
+kubectl create secret generic cloudflare-credentials --from-literal=apiToken=...
+kubectl apply -f config/samples/openinspect_v1alpha1_openinspect.yaml
+```
+
+Or via kustomize:
+
 ```sh
 make install                                        # CRDs
 make docker-build docker-push IMG=<registry>/openinspect-operator:tag
 make deploy IMG=<registry>/openinspect-operator:tag
-kubectl create secret generic cloudflare-credentials --from-literal=apiToken=...
-kubectl apply -f config/samples/openinspect_v1alpha1_openinspect.yaml
 ```
 
 ### Tests
@@ -121,6 +173,12 @@ Point `spec.cloudflare.apiBaseURL` at it for hermetic testing.
 kubectl delete -k config/samples/   # CRs first, so finalizers clean up Cloudflare
 make undeploy uninstall
 ```
+
+### Provider development
+
+See [Adding a Sandbox Provider](docs/ADDING_SANDBOX_PROVIDER.md) for the full
+SDK/client, CRD, ownership, finalizer, testing, and release checklist. Modal
+and Daytona are currently the only fully supported providers.
 
 ## License
 
