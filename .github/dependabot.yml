@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Keep GitHub Actions pinned to fresh commit SHAs. Dependabot preserves the
+  # SHA-pin style and refreshes the `# vX.Y.Z` comment on each bump.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # One PR per week for all action bumps instead of one PR per action.
+      github-actions:
+        patterns:
+          - "*"
