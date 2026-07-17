@@ -68,6 +68,11 @@ linters:
       - linters:
           - gosec
         path: ^test/
+      # The events API replacement (GetEventRecorder) has an incompatible
+      # interface; the classic recorder stays until kubebuilder migrates.
+      - linters:
+          - staticcheck
+        text: "SA1019: mgr.GetEventRecorderFor"
     paths:
       - third_party$
       - builtin$

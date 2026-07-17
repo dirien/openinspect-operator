@@ -23,9 +23,13 @@ const providerModal = "modal"
 // modalAppName is the fixed name used by the clean upstream Modal deployment.
 const modalAppName = "open-inspect"
 
+// modalDefaultEnvironment is Modal's default environment name; the CRD
+// defaults spec.environment to it and it publishes without a URL suffix.
+const modalDefaultEnvironment = "main"
+
 func modalEnvironment(m *openinspectv1alpha1.ModalSandboxSpec) string {
 	if m.Environment == "" {
-		return "main"
+		return modalDefaultEnvironment
 	}
 	return m.Environment
 }

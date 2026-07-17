@@ -144,7 +144,7 @@ func validateSandbox(sb *openinspectv1alpha1.SandboxSpec, workers map[string]boo
 	// "main" environment works at runtime but makes cleanup look in the wrong
 	// environment (silently leaking the real app, or stopping a stranger's).
 	if m := sb.Modal; m != nil && m.EnvironmentWebSuffix != "" &&
-		modalEnvironment(m) == "main" && m.EnvironmentWebSuffix != "main" {
+		modalEnvironment(m) == modalDefaultEnvironment && m.EnvironmentWebSuffix != modalDefaultEnvironment {
 		return fmt.Errorf("sandbox.modal.environmentWebSuffix %q is set while environment is %q: set spec.sandbox.modal.environment to the Modal environment name the app is deployed in",
 			m.EnvironmentWebSuffix, modalEnvironment(m))
 	}
