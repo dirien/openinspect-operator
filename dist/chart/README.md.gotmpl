@@ -1,9 +1,11 @@
 {{ template "chart.header" . }}
 
-![Version](https://img.shields.io/static/v1?label=Version&message={{ .Version }}&color=informational&style=flat-square) <!-- x-release-please-version -->
-![Type: {{ .Type }}](https://img.shields.io/badge/Type-{{ .Type }}-informational?style=flat-square)
-![AppVersion](https://img.shields.io/static/v1?label=AppVersion&message={{ .AppVersion }}&color=informational&style=flat-square) <!-- x-release-please-version -->
+![Release](https://img.shields.io/github/v/release/dirien/openinspect-operator?style=flat-square) ![Type: {{ .Type }}](https://img.shields.io/badge/Type-{{ .Type }}-informational?style=flat-square)
 
 {{ template "chart.description" . }}
+
+The chart version and appVersion are stamped from the git tag when the chart
+is packaged and pushed; the version in the committed Chart.yaml is a
+placeholder.
 
 {{ template "chart.valuesSection" . }}

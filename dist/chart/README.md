@@ -1,10 +1,12 @@
 # openinspect-operator
 
-![Version](https://img.shields.io/static/v1?label=Version&message=0.1.0&color=informational&style=flat-square) <!-- x-release-please-version -->
-![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
-![AppVersion](https://img.shields.io/static/v1?label=AppVersion&message=0.1.0&color=informational&style=flat-square) <!-- x-release-please-version -->
+![Release](https://img.shields.io/github/v/release/dirien/openinspect-operator?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
 
 A Helm chart to distribute the project openinspect-operator
+
+The chart version and appVersion are stamped from the git tag when the chart
+is packaged and pushed; the version in the committed Chart.yaml is a
+placeholder.
 
 ## Values
 

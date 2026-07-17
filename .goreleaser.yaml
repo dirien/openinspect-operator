@@ -68,10 +68,21 @@ docker_signs:
 sboms:
   - artifacts: archive
 
-# release-please owns the GitHub release and its notes; GoReleaser only
-# attaches artifacts to it.
-release:
-  mode: keep-existing
-
 changelog:
-  disable: true
+  use: github
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '^feat(\(.+\))?!?:'
+      order: 0
+    - title: Fixes
+      regexp: '^fix(\(.+\))?!?:'
+      order: 1
+    - title: Other
+      order: 999
+  filters:
+    exclude:
+      - "^chore"
+      - "^docs"
+      - "^test"
+      - "^ci"
