@@ -1,8 +1,8 @@
 # openinspect-operator
 
-![Version](https://img.shields.io/static/v1?label=Version&message=0.1.0&color=informational&style=flat-square) <!-- x-release-please-version -->
+![Version](https://img.shields.io/static/v1?label=Version&message=0.2.0&color=informational&style=flat-square) <!-- x-release-please-version -->
 ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square)
-![AppVersion](https://img.shields.io/static/v1?label=AppVersion&message=0.1.0&color=informational&style=flat-square) <!-- x-release-please-version -->
+![AppVersion](https://img.shields.io/static/v1?label=AppVersion&message=0.2.0&color=informational&style=flat-square) <!-- x-release-please-version -->
 
 A Helm chart to distribute the project openinspect-operator
 
