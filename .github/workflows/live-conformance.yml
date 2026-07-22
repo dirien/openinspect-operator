@@ -1,0 +1,63 @@
+name: Live provider conformance
+
+# Guarded, cost-limited nightly conformance against the real providers
+# (EPIC1 section 9). Runs only when the corresponding secrets are configured;
+# each test builds uniquely named artifacts and deletes what it creates.
+on:
+  schedule:
+    - cron: "43 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  daytona:
+    name: Daytona artifact lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run live Daytona conformance
+        env:
+          DAYTONA_API_KEY: ${{ secrets.LIVE_DAYTONA_API_KEY }}
+          DAYTONA_API_URL: ${{ vars.LIVE_DAYTONA_API_URL || 'https://app.daytona.io/api' }}
+        run: |
+          if [ -z "$DAYTONA_API_KEY" ]; then
+            echo "LIVE_DAYTONA_API_KEY not configured; skipping"
+            exit 0
+          fi
+          OI_LIVE_DAYTONA=1 go test -tags=live ./test/live/ -run Daytona -v -timeout 45m
+
+  modal:
+    name: Modal discovery and health
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Run live Modal conformance
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.LIVE_MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.LIVE_MODAL_TOKEN_SECRET }}
+          MODAL_WORKSPACE: ${{ vars.LIVE_MODAL_WORKSPACE }}
+          MODAL_ENVIRONMENT: ${{ vars.LIVE_MODAL_ENVIRONMENT || 'main' }}
+        run: |
+          if [ -z "$MODAL_TOKEN_ID" ]; then
+            echo "LIVE_MODAL_TOKEN_ID not configured; skipping"
+            exit 0
+          fi
+          OI_LIVE_MODAL=1 go test -tags=live ./test/live/ -run Modal -v -timeout 10m
