@@ -14,3 +14,7 @@
 # (internal/runtime, platform bundles) and the COPY source of
 # Dockerfile.runtime.
 !third_party/background-agents/**
+
+# Embedded platform worker bundles (go:embed in internal/platformbundle).
+!internal/platformbundle/*.js.gz
+!internal/platformbundle/metadata.json
