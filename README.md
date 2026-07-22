@@ -145,23 +145,24 @@ self-service on a shared cluster: many `OpenInspect` CRs, one operator.
 
 ### Deploy
 
-Via Helm (chart in `dist/chart`, CRD included and kept on uninstall):
+**Full walkthrough (any cluster, per-provider secrets): [docs/INSTALL.md](docs/INSTALL.md).**
+
+From a release (chart + images published together; the chart defaults to its
+own release's images, CRD included and kept on uninstall):
 
 ```sh
-make docker-build docker-push IMG=<registry>/openinspect-operator:tag
-helm install openinspect-operator dist/chart -n openinspect-operator-system --create-namespace \
-  --set controllerManager.container.image.repository=<registry>/openinspect-operator \
-  --set controllerManager.container.image.tag=tag
+helm install openinspect-operator oci://ghcr.io/dirien/charts/openinspect-operator \
+  --version <X.Y.Z> -n openinspect-operator-system --create-namespace
 kubectl create secret generic cloudflare-credentials --from-literal=apiToken=...
-kubectl apply -f config/samples/openinspect_v1alpha1_openinspect.yaml
+kubectl apply -f config/samples/openinspect_v1alpha1_openinspect_daytona.yaml   # or the modal sample
 ```
 
-Or via kustomize:
+From source (dev):
 
 ```sh
 make install                                        # CRDs
 make docker-build docker-push IMG=<registry>/openinspect-operator:tag
-make deploy IMG=<registry>/openinspect-operator:tag
+make deploy IMG=<registry>/openinspect-operator:tag # also set RELATED_IMAGE_* to match
 ```
 
 ### Tests
