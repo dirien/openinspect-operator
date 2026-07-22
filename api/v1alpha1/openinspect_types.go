@@ -72,7 +72,8 @@ type D1Spec struct {
 	// migration files (e.g. 0001_init.sql), applied in key order and tracked
 	// in a _schema_migrations table by numeric prefix (upstream d1-migrate.sh
 	// semantics). Empty applies the release's embedded migrations from the
-	// pinned upstream revision; the ConfigMap is a development override.
+	// pinned upstream revision; the ConfigMap is a development override
+	// (reference an empty ConfigMap to apply no migrations at all).
 	// +optional
 	MigrationsConfigMapRef string `json:"migrationsConfigMapRef,omitempty"`
 }
@@ -238,9 +239,12 @@ type DaytonaSandboxSpec struct {
 // managed build is the default; setting an explicit external reference
 // (daytona.baseSnapshot) is the override that disables it.
 type SandboxRuntimeSpec struct {
-	// Image overrides the container base the managed artifact builds FROM
-	// (e.g. a pinned ghcr.io/dirien/openinspect-sandbox-runtime tag). Empty
-	// means the release's bundled runtime recipe, built from its base image.
+	// Image overrides the container base the managed artifact builds FROM.
+	// It must be an image built from this operator's runtime manifest —
+	// normally ghcr.io/dirien/openinspect-sandbox-runtime, pinned by digest
+	// (the reference string identifies the artifact, so a mutable tag that
+	// is re-pushed does NOT trigger a rebuild). Empty means the release's
+	// bundled runtime recipe, built from its base image.
 	// +kubebuilder:validation:MaxLength=512
 	// +optional
 	Image string `json:"image,omitempty"`

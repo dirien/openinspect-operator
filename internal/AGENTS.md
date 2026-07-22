@@ -44,9 +44,9 @@ Go packages implementing the operator: `controller/` (reconciliation), `cloudfla
 
 - Primary object and `persistStatus` MUST use live API reads (`mgr.GetAPIReader()`); a cached read can persist stale status and wipe recorded resource IDs.
 - Status uses `metav1.Condition`; condition reasons are machine API — renaming is a breaking change. Remove a feature's condition when its spec section is removed (see `controller/web.go`, `controller/appsecrets.go`).
-- cloudflare-go v7 auto-pager stops only on an EMPTY page — list mocks must return empty for `page >= 2` or `iter.Next()` hangs; keep the `maxListItems` guard (Daytona sweep: `maxDaytonaSweepItems`).
+- cloudflare-go v7 auto-pager stops only on an EMPTY page — list mocks must return empty for `page >= 2` or `iter.Next()` hangs; keep the `maxListItems` guards (one in `cloudflare/cf.go`, one in `sandbox/provider/daytona`).
 - Deletion order is load-bearing: workers first (stops new sessions), then provider sweep (reads D1 session evidence), KV, R2, D1 LAST. `D1SessionIDs` returns `found=false` for a missing database/table so deletion degrades to a skipped sweep (`DaytonaSweepSkipped`) instead of wedging the finalizer.
-- `cleanupModalApp` resolves the app by environment NAME; a web suffix on the defaulted `main` environment is rejected in `validateSandbox`, and app-not-found cleanup emits `ModalAppNotFound` — never a fabricated `ModalAppStopped`.
+- `cleanupModalApp` resolves the app by environment NAME (the web suffix is discovered from deployed endpoints into `status.modalApp`, never configured), and app-not-found cleanup emits `ModalAppNotFound` — never a fabricated `ModalAppStopped`.
 
 ## Security & safety
 

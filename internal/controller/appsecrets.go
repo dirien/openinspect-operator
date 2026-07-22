@@ -135,18 +135,7 @@ func (r *OpenInspectReconciler) ensureAppSecrets(ctx context.Context, oi *openin
 // internalCallbackSecret resolves the control-plane worker's
 // INTERNAL_CALLBACK_SECRET binding value, which authenticates /secrets calls.
 func (r *OpenInspectReconciler) internalCallbackSecret(ctx context.Context, oi *openinspectv1alpha1.OpenInspect) (string, error) {
-	name := controlPlaneWorkerName(oi)
-	for _, w := range oi.Spec.Workers {
-		if w.Name != name {
-			continue
-		}
-		for _, s := range w.Secrets {
-			if s.Binding == internalCallbackSecretBinding {
-				return r.secretValue(ctx, oi.Namespace, s.SecretRef)
-			}
-		}
-	}
-	return "", fmt.Errorf("appSecrets requires an %s secret binding on worker %q", internalCallbackSecretBinding, name)
+	return r.workerSecretValue(ctx, oi, internalCallbackSecretBinding)
 }
 
 // hashAppSecrets fingerprints the desired key/value set so unchanged values

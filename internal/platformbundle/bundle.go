@@ -75,8 +75,23 @@ func Has(name string) bool {
 	return ok
 }
 
-// Script returns the uncompressed worker bundle for the given name.
+var scriptCache sync.Map // name -> []byte (immutable, do not mutate)
+
+// Script returns the uncompressed worker bundle for the given name. The
+// returned slice is a shared cache entry — callers must not mutate it.
 func Script(name string) ([]byte, error) {
+	if cached, ok := scriptCache.Load(name); ok {
+		return cached.([]byte), nil
+	}
+	body, err := decompressBundle(name)
+	if err != nil {
+		return nil, err
+	}
+	scriptCache.Store(name, body)
+	return body, nil
+}
+
+func decompressBundle(name string) ([]byte, error) {
 	raw, err := bundles.ReadFile(name + ".js.gz")
 	if err != nil {
 		return nil, fmt.Errorf("no built-in bundle %q: %w", name, err)
@@ -96,9 +111,16 @@ func Script(name string) ([]byte, error) {
 	return body, nil
 }
 
+var migrationsOnce = sync.OnceValues(loadMigrations)
+
 // Migrations returns the pinned D1 schema migrations as filename -> SQL,
-// the same shape a d1-migrations ConfigMap carries.
+// the same shape a d1-migrations ConfigMap carries. The returned map is a
+// shared cache entry — callers must not mutate it.
 func Migrations() (map[string]string, error) {
+	return migrationsOnce()
+}
+
+func loadMigrations() (map[string]string, error) {
 	root, err := upstream.MigrationsFS()
 	if err != nil {
 		return nil, err

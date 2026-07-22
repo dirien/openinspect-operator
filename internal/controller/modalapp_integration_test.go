@@ -329,6 +329,47 @@ var _ = Describe("Modal provider app", func() {
 		Expect(cond.Message).To(ContainSubstring("BackoffLimitExceeded"))
 	})
 
+	It("refuses a younger CR sharing the Modal workspace and environment", func() {
+		older := &openinspectv1alpha1.OpenInspect{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       modalAppSpec(),
+		}
+		Expect(k8sClient.Create(ctx, older)).To(Succeed())
+
+		youngerSpec := modalAppSpec()
+		youngerSpec.DeploymentName = "modalapp2"
+		younger := &openinspectv1alpha1.OpenInspect{
+			ObjectMeta: metav1.ObjectMeta{Name: name + "-younger", Namespace: ns},
+			Spec:       youngerSpec,
+		}
+		Expect(k8sClient.Create(ctx, younger)).To(Succeed())
+		DeferCleanup(func() {
+			obj := &openinspectv1alpha1.OpenInspect{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: younger.Name, Namespace: ns}, obj); err == nil {
+				obj.Finalizers = nil
+				_ = k8sClient.Update(ctx, obj)
+				_ = k8sClient.Delete(ctx, obj)
+			}
+		})
+
+		// The younger CR must not converge secrets or deploy — it would
+		// clobber the older installation's environment-scoped wiring.
+		before := ensuredCalls
+		_, err := reconciler.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: younger.Name, Namespace: ns}})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(ensuredCalls).To(Equal(before))
+
+		got := &openinspectv1alpha1.OpenInspect{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: younger.Name, Namespace: ns}, got)).To(Succeed())
+		cond := meta.FindStatusCondition(got.Status.Conditions, openinspectv1alpha1.ConditionProviderApp)
+		Expect(cond).NotTo(BeNil())
+		Expect(cond.Reason).To(Equal("ModalEnvironmentConflict"))
+
+		// The older CR reconciles unhindered.
+		Expect(reconcile()).To(Succeed())
+		Expect(ensuredCalls).To(Equal(before + 1))
+	})
+
 	It("rejects a modal spec without the upstream app inputs as InvalidSpec", func() {
 		spec := modalAppSpec()
 		spec.AppSecrets = nil

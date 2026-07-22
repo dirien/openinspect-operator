@@ -92,15 +92,20 @@ func isNotFound(err error) bool {
 }
 
 // phase maps Daytona snapshot states onto the provider-neutral phases.
-// Inactive snapshots reactivate on use, so they count as Ready.
-func phase(state string) provider.ArtifactPhase {
+// Inactive snapshots reactivate on use, so they count as Ready. Unknown
+// states (including the OpenAPI unknown-enum sentinel for states newer than
+// the pinned SDK) map to ok=false: unknown is neither buildable-over nor
+// deletable — callers must fail closed and retry.
+func phase(state string) (provider.ArtifactPhase, bool) {
 	switch state {
 	case "active", "inactive":
-		return provider.ArtifactReady
+		return provider.ArtifactReady, true
 	case "error", "build_failed":
-		return provider.ArtifactFailed
-	default: // pending, building, pulling, removing, ...
-		return provider.ArtifactBuilding
+		return provider.ArtifactFailed, true
+	case "pending", "building", "pulling", "removing":
+		return provider.ArtifactBuilding, true
+	default:
+		return "", false
 	}
 }
 
@@ -122,7 +127,11 @@ func (p *Provider) inspect(ctx context.Context, client *daytona.Client, name str
 		}
 		return provider.ArtifactState{}, fmt.Errorf("get daytona snapshot %q: %w", name, err)
 	}
-	state := provider.ArtifactState{Phase: phase(snap.State), ID: snap.ID}
+	mapped, known := phase(snap.State)
+	if !known {
+		return provider.ArtifactState{}, fmt.Errorf("daytona snapshot %q is in unrecognized state %q: refusing to act on unknown state", name, snap.State)
+	}
+	state := provider.ArtifactState{Phase: mapped, ID: snap.ID}
 	if snap.ErrorReason != nil {
 		state.Message = *snap.ErrorReason
 	}

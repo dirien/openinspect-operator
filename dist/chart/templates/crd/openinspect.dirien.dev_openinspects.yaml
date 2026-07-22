@@ -146,7 +146,8 @@ spec:
                       migration files (e.g. 0001_init.sql), applied in key order and tracked
                       in a _schema_migrations table by numeric prefix (upstream d1-migrate.sh
                       semantics). Empty applies the release's embedded migrations from the
-                      pinned upstream revision; the ConfigMap is a development override.
+                      pinned upstream revision; the ConfigMap is a development override
+                      (reference an empty ConfigMap to apply no migrations at all).
                     type: string
                 type: object
               deletionPolicy:
@@ -371,9 +372,12 @@ spec:
                         type: string
                       image:
                         description: |-
-                          Image overrides the container base the managed artifact builds FROM
-                          (e.g. a pinned ghcr.io/dirien/openinspect-sandbox-runtime tag). Empty
-                          means the release's bundled runtime recipe, built from its base image.
+                          Image overrides the container base the managed artifact builds FROM.
+                          It must be an image built from this operator's runtime manifest —
+                          normally ghcr.io/dirien/openinspect-sandbox-runtime, pinned by digest
+                          (the reference string identifies the artifact, so a mutable tag that
+                          is re-pushed does NOT trigger a rebuild). Empty means the release's
+                          bundled runtime recipe, built from its base image.
                         maxLength: 512
                         type: string
                       updatePolicy:

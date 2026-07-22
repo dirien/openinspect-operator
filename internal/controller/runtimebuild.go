@@ -10,6 +10,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -91,6 +92,14 @@ func (r *OpenInspectReconciler) ensureSandboxRuntime(ctx context.Context, oi *op
 		// No provider-owned artifact to manage: Modal's base image belongs
 		// to the deployed upstream app (ensureModalApp owns the RuntimeReady
 		// condition there); other providers have no managed artifact (D3).
+		// A provider switch must not drop managed-artifact references on the
+		// floor — without Daytona credentials they cannot be deleted, so
+		// their complete references are recorded before the status goes.
+		if st := oi.Status.SandboxRuntime; st != nil && len(managedArtifactRefs(st)) > 0 {
+			r.Recorder.Eventf(oi, corev1.EventTypeWarning, "RuntimeArtifactsOrphaned",
+				"provider switched away from daytona; managed snapshots left behind: %s",
+				strings.Join(managedArtifactRefs(st), ", "))
+		}
 		oi.Status.SandboxRuntime = nil
 		if sb == nil || sb.Provider != providerModal {
 			meta.RemoveStatusCondition(&oi.Status.Conditions, openinspectv1alpha1.ConditionRuntime)
@@ -100,13 +109,25 @@ func (r *OpenInspectReconciler) ensureSandboxRuntime(ctx context.Context, oi *op
 	d := sb.Daytona
 
 	// External reference: used as-is, never built, inspected, or deleted.
+	// A previously managed artifact is retired (not erased) so GC and
+	// finalization still find it.
 	if d.BaseSnapshot != "" {
-		oi.Status.SandboxRuntime = &openinspectv1alpha1.SandboxRuntimeStatus{
-			Provider:           providerDaytona,
-			Phase:              openinspectv1alpha1.RuntimePhaseExternal,
-			ArtifactName:       d.BaseSnapshot,
-			ObservedGeneration: oi.Generation,
+		st := oi.Status.SandboxRuntime
+		if st == nil {
+			st = &openinspectv1alpha1.SandboxRuntimeStatus{}
+			oi.Status.SandboxRuntime = st
 		}
+		if st.ArtifactName != "" && st.ArtifactName != d.BaseSnapshot && st.Phase != openinspectv1alpha1.RuntimePhaseExternal {
+			r.retireArtifact(oi, st)
+		}
+		st.Provider = providerDaytona
+		st.Phase = openinspectv1alpha1.RuntimePhaseExternal
+		st.ArtifactName = d.BaseSnapshot
+		st.ArtifactID = ""
+		st.Digest = ""
+		st.SourceRevision = ""
+		st.ObservedGeneration = oi.Generation
+		r.gcRetiredArtifacts(ctx, oi)
 		r.setCondition(oi, openinspectv1alpha1.ConditionRuntime, metav1.ConditionTrue,
 			"ExternalArtifact", fmt.Sprintf("using externally owned snapshot %q as-is", d.BaseSnapshot))
 		return false, nil
@@ -126,6 +147,11 @@ func (r *OpenInspectReconciler) ensureSandboxRuntime(ctx context.Context, oi *op
 	st.Provider = providerDaytona
 	st.ObservedGeneration = oi.Generation
 
+	// Superseded artifacts past their rollback grace period are collected
+	// here, on the ordinary reconcile cadence (D6) — including while an
+	// updatePolicy hold is in effect.
+	r.gcRetiredArtifacts(ctx, oi)
+
 	// ArtifactName/Digest always describe the ACTIVE artifact — the one the
 	// control plane is wired to. During an upgrade build the old reference
 	// keeps serving; it flips (and the old artifact is retired for
@@ -133,14 +159,21 @@ func (r *OpenInspectReconciler) ensureSandboxRuntime(ctx context.Context, oi *op
 	if sb.Runtime != nil && sb.Runtime.UpdatePolicy == "Never" &&
 		st.Phase == openinspectv1alpha1.RuntimePhaseReady &&
 		st.ArtifactName != "" && st.ArtifactName != target.name {
+		// Never means never BUILD — but an artifact with the current digest
+		// that already exists remotely still flips the reference, as the
+		// API documents.
+		state, err := r.inspectRuntimeArtifact(ctx, oi, provider.Artifact{Name: target.name})
+		if err != nil {
+			return false, err
+		}
+		if state.Phase == provider.ArtifactReady {
+			r.activateArtifact(oi, st, target, state.ID)
+			return false, nil
+		}
 		r.setCondition(oi, openinspectv1alpha1.ConditionRuntime, metav1.ConditionTrue,
 			"UpdatePolicyNever", fmt.Sprintf("holding artifact %s; digest %s not rolled out (updatePolicy: Never)", st.ArtifactName, target.shortDigest))
 		return false, nil
 	}
-
-	// Superseded artifacts past their rollback grace period are collected
-	// here, on the ordinary reconcile cadence (D6).
-	r.gcRetiredArtifacts(ctx, oi)
 
 	job := &batchv1.Job{}
 	jobName := runtimeBuildJobName(oi, target.shortDigest)
@@ -154,6 +187,19 @@ func (r *OpenInspectReconciler) ensureSandboxRuntime(ctx context.Context, oi *op
 	return r.runtimeFromRemote(ctx, oi, st, jobName, target)
 }
 
+// managedArtifactRefs lists every managed snapshot the status still
+// references (active + retired); nil when nothing managed is recorded.
+func managedArtifactRefs(st *openinspectv1alpha1.SandboxRuntimeStatus) []string {
+	refs := make([]string, 0, len(st.PreviousArtifacts)+1)
+	if st.ArtifactName != "" && st.Phase != openinspectv1alpha1.RuntimePhaseExternal {
+		refs = append(refs, st.ArtifactName)
+	}
+	for _, retired := range st.PreviousArtifacts {
+		refs = append(refs, retired.Name)
+	}
+	return refs
+}
+
 // runtimeTarget is the artifact the CR converges toward this reconcile.
 type runtimeTarget struct {
 	fullDigest  string
@@ -162,11 +208,20 @@ type runtimeTarget struct {
 }
 
 // activateArtifact flips the active reference to the confirmed-ready target,
-// retiring a superseded artifact for grace-period GC (D6).
+// retiring a superseded artifact for grace-period GC (D6). A re-activated
+// artifact (rollback within the grace period) is removed from the retired
+// list so GC can never delete the artifact that is serving.
 func (r *OpenInspectReconciler) activateArtifact(oi *openinspectv1alpha1.OpenInspect, st *openinspectv1alpha1.SandboxRuntimeStatus, target runtimeTarget, id string) {
-	if st.ArtifactName != "" && st.ArtifactName != target.name {
+	if st.ArtifactName != "" && st.ArtifactName != target.name && st.Phase != openinspectv1alpha1.RuntimePhaseExternal {
 		r.retireArtifact(oi, st)
 	}
+	kept := st.PreviousArtifacts[:0]
+	for _, retired := range st.PreviousArtifacts {
+		if retired.Name != target.name {
+			kept = append(kept, retired)
+		}
+	}
+	st.PreviousArtifacts = kept
 	st.ArtifactName = target.name
 	st.ArtifactID = id
 	st.Digest = target.fullDigest
@@ -203,11 +258,23 @@ func (r *OpenInspectReconciler) runtimeFromJob(
 			r.activateArtifact(oi, st, target, state.ID)
 			return false, nil
 		}
-		// The Job claims success but the artifact is not usable: surface
-		// it instead of trusting the exit code.
+		if state.Phase == provider.ArtifactBuilding {
+			// The Job exited before the provider finished processing (e.g.
+			// the snapshot is still pulling): not a failure, keep waiting.
+			st.Phase = openinspectv1alpha1.RuntimePhaseBuilding
+			r.setCondition(oi, openinspectv1alpha1.ConditionRuntime, metav1.ConditionFalse,
+				"RuntimeBuilding", fmt.Sprintf("artifact %s still processing on the provider", target.name))
+			return true, nil
+		}
+		// The Job claims success but the artifact is not usable: surface it
+		// AND delete the stale Job, otherwise its success would block the
+		// rebuild until the Job's TTL expires.
+		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && client.IgnoreNotFound(err) != nil {
+			return true, err
+		}
 		st.Phase = openinspectv1alpha1.RuntimePhaseFailed
 		r.setCondition(oi, openinspectv1alpha1.ConditionRuntime, metav1.ConditionFalse,
-			"RuntimeArtifactMissing", fmt.Sprintf("build job succeeded but artifact %s is %s: %s", target.name, state.Phase, state.Message))
+			"RuntimeArtifactMissing", fmt.Sprintf("build job succeeded but artifact %s is %s: %s; rebuilding", target.name, state.Phase, state.Message))
 		return true, nil
 	case jobFailed(job):
 		st.Phase = openinspectv1alpha1.RuntimePhaseFailed
@@ -280,7 +347,9 @@ func (r *OpenInspectReconciler) runtimeFromRemote(
 }
 
 // retireArtifact moves the current managed artifact into the grace-period
-// GC list, deduplicated by name and bounded to the API's MaxItems.
+// GC list, deduplicated by name and bounded to the API's MaxItems. An entry
+// forced out by the bound is recorded in a warning event — the reference
+// must never vanish without a durable trace.
 func (r *OpenInspectReconciler) retireArtifact(oi *openinspectv1alpha1.OpenInspect, st *openinspectv1alpha1.SandboxRuntimeStatus) {
 	for _, prev := range st.PreviousArtifacts {
 		if prev.Name == st.ArtifactName {
@@ -290,8 +359,11 @@ func (r *OpenInspectReconciler) retireArtifact(oi *openinspectv1alpha1.OpenInspe
 	st.PreviousArtifacts = append(st.PreviousArtifacts, openinspectv1alpha1.RetiredArtifact{
 		Name: st.ArtifactName, ID: st.ArtifactID, RetiredAt: metav1.Now(),
 	})
-	if len(st.PreviousArtifacts) > 10 {
-		st.PreviousArtifacts = st.PreviousArtifacts[len(st.PreviousArtifacts)-10:]
+	for len(st.PreviousArtifacts) > 10 {
+		dropped := st.PreviousArtifacts[0]
+		st.PreviousArtifacts = st.PreviousArtifacts[1:]
+		r.Recorder.Eventf(oi, corev1.EventTypeWarning, "RuntimeArtifactUnrecorded",
+			"retired artifact list is full; dropping oldest reference %s (id %s) — delete it manually if it still exists", dropped.Name, dropped.ID)
 	}
 	r.Recorder.Eventf(oi, corev1.EventTypeNormal, "RuntimeArtifactRetired",
 		"artifact %s superseded; retained for rollback grace period", st.ArtifactName)
@@ -420,7 +492,12 @@ func (r *OpenInspectReconciler) createRuntimeBuildJob(ctx context.Context, oi *o
 	if err := ctrl.SetControllerReference(oi, job, r.Scheme); err != nil {
 		return err
 	}
-	return r.Create(ctx, job)
+	// Tolerate a reconcile racing the Job informer: the cached Get missed a
+	// Job that already exists — the next pass reflects it.
+	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	return nil
 }
 
 func jobSucceeded(job *batchv1.Job) bool {

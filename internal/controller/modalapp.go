@@ -4,14 +4,17 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -27,6 +30,12 @@ import (
 // modalDeployRetryInterval mirrors runtimeBuildRetryInterval for the
 // modal-deploy Job.
 const modalDeployRetryInterval = 10 * time.Minute
+
+// ownerKey parses the namespace/name strings sharedModalApp returns.
+func ownerKey(namespaceName string) types.NamespacedName {
+	ns, name, _ := strings.Cut(namespaceName, "/")
+	return types.NamespacedName{Namespace: ns, Name: name}
+}
 
 // GitHub App bindings on the control-plane worker that the upstream Modal
 // app also needs (as its github-app secret).
@@ -60,6 +69,27 @@ func (r *OpenInspectReconciler) ensureProviderApp(ctx context.Context, oi *openi
 // the secret inputs changed, and discovers + health-checks the deployed
 // endpoints into status.modalApp.
 func (r *OpenInspectReconciler) ensureModalApp(ctx context.Context, oi *openinspectv1alpha1.OpenInspect, cf *cfclient.Client) (pending bool, err error) {
+	// One installation per Modal environment: the app name, its named
+	// secrets, and CONTROL_PLANE_URL are all environment-scoped, so a second
+	// CR converging the same workspace+environment would clobber the first's
+	// wiring. The oldest claimant wins, deterministically — the same rule
+	// claimConflict applies to Cloudflare names.
+	if owner, err := r.sharedModalApp(ctx, oi); err != nil {
+		return false, err
+	} else if owner != "" {
+		other := &openinspectv1alpha1.OpenInspect{}
+		if err := r.liveReader().Get(ctx, ownerKey(owner), other); err == nil && precedes(other, oi) {
+			m := oi.Spec.Sandbox.Modal
+			r.setCondition(oi, openinspectv1alpha1.ConditionProviderApp, metav1.ConditionFalse,
+				"ModalEnvironmentConflict",
+				fmt.Sprintf("modal workspace %q environment %q is already managed by OpenInspect %s; use a separate Modal environment per installation",
+					m.Workspace, modalEnvironment(m), owner))
+			r.setCondition(oi, openinspectv1alpha1.ConditionRuntime, metav1.ConditionFalse,
+				"ModalEnvironmentConflict", "waiting for a dedicated Modal environment")
+			return true, nil
+		}
+	}
+
 	m := oi.Spec.Sandbox.Modal
 	tokenID, err := r.secretValue(ctx, oi.Namespace, m.TokenIDSecretRef)
 	if err != nil {
@@ -334,7 +364,9 @@ func (r *OpenInspectReconciler) workerSecretValue(ctx context.Context, oi *openi
 }
 
 // hashModalSecrets fingerprints the desired named-secret set, HMAC-keyed so
-// the published hash cannot be reversed.
+// the published hash cannot be reversed. Every field is length-prefixed:
+// separator-only framing would let values containing the separator byte
+// alias a different key/value split into the same hash.
 func hashModalSecrets(secrets map[string]map[string]string, key string) string {
 	names := make([]string, 0, len(secrets))
 	for name := range secrets {
@@ -342,19 +374,22 @@ func hashModalSecrets(secrets map[string]map[string]string, key string) string {
 	}
 	sort.Strings(names)
 	h := hmac.New(sha256.New, []byte(key))
+	writeField := func(s string) {
+		var lenBuf [8]byte
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(s)))
+		h.Write(lenBuf[:])
+		h.Write([]byte(s))
+	}
 	for _, name := range names {
-		h.Write([]byte(name))
-		h.Write([]byte{0})
+		writeField(name)
 		keys := make([]string, 0, len(secrets[name]))
 		for k := range secrets[name] {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			h.Write([]byte(k))
-			h.Write([]byte{0})
-			h.Write([]byte(secrets[name][k]))
-			h.Write([]byte{0})
+			writeField(k)
+			writeField(secrets[name][k])
 		}
 	}
 	return hex.EncodeToString(h.Sum(nil))
@@ -401,7 +436,9 @@ func (r *OpenInspectReconciler) createModalDeployJob(ctx context.Context, oi *op
 	deadline := int64(1800)
 	noToken := false
 	runAsNonRoot, runAsUser := true, int64(65532)
-	noPrivEsc := false
+	// HOME=/tmp in the image and /tmp is an emptyDir, so a read-only root
+	// holds (verified against the image: uv + modal run fine).
+	noPrivEsc, roRootFS := false, true
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      jobName,
@@ -435,6 +472,7 @@ func (r *OpenInspectReconciler) createModalDeployJob(ctx context.Context, oi *op
 						Env:   env,
 						SecurityContext: &corev1.SecurityContext{
 							AllowPrivilegeEscalation: &noPrivEsc,
+							ReadOnlyRootFilesystem:   &roRootFS,
 							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 						},
 						// The Modal CLI writes build state under /tmp.
@@ -451,5 +489,9 @@ func (r *OpenInspectReconciler) createModalDeployJob(ctx context.Context, oi *op
 	if err := ctrl.SetControllerReference(oi, job, r.Scheme); err != nil {
 		return err
 	}
-	return r.Create(ctx, job)
+	// Tolerate a reconcile racing the Job informer (see createRuntimeBuildJob).
+	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	return nil
 }

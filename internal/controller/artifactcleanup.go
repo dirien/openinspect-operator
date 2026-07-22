@@ -32,7 +32,12 @@ func (r *OpenInspectReconciler) deleteRuntimeArtifact(ctx context.Context, oi *o
 	if r.RuntimeDelete != nil {
 		return r.RuntimeDelete(ctx, oi, artifact)
 	}
+	// Fail closed, never panic: the finalizer path runs without validateSpec,
+	// so a hand-edited spec may lack the section entirely.
 	d := oi.Spec.Sandbox.Daytona
+	if d == nil {
+		return fmt.Errorf("cannot delete managed artifact %s: spec.sandbox.daytona was removed (restore it or set spec.deletionPolicy: Orphan)", artifact.Name)
+	}
 	apiKey, err := r.secretValue(ctx, oi.Namespace, d.APIKeySecretRef)
 	if err != nil {
 		return fmt.Errorf("daytona api key: %w", err)
@@ -57,6 +62,12 @@ func (r *OpenInspectReconciler) gcRetiredArtifacts(ctx context.Context, oi *open
 	}
 	var kept []openinspectv1alpha1.RetiredArtifact
 	for _, retired := range st.PreviousArtifacts {
+		// Never delete the artifact that is currently serving: a rollback
+		// can re-activate a retired artifact (activateArtifact also drops
+		// it from this list — this is defense in depth).
+		if retired.Name == st.ArtifactName {
+			continue
+		}
 		if time.Since(retired.RetiredAt.Time) < retiredArtifactGracePeriod {
 			kept = append(kept, retired)
 			continue
@@ -82,12 +93,12 @@ func (r *OpenInspectReconciler) cleanupManagedArtifact(ctx context.Context, oi *
 	if sb == nil || sb.Provider != providerDaytona || st == nil {
 		return nil
 	}
-	if st.Phase == openinspectv1alpha1.RuntimePhaseExternal {
-		// Externally owned, used as-is — never deleted (EPIC1 section 4).
-		return nil
-	}
+	// The ACTIVE artifact is deleted only when it is operator-managed; an
+	// external reference (Phase External) is used as-is and never deleted
+	// (EPIC1 section 4). Retired MANAGED artifacts are deleted either way.
+	deleteActive := st.Phase != openinspectv1alpha1.RuntimePhaseExternal && st.ArtifactName != ""
 	refs := make([]string, 0, len(st.PreviousArtifacts)+1)
-	if st.ArtifactName != "" {
+	if deleteActive {
 		refs = append(refs, st.ArtifactName)
 	}
 	for _, retired := range st.PreviousArtifacts {
@@ -103,17 +114,17 @@ func (r *OpenInspectReconciler) cleanupManagedArtifact(ctx context.Context, oi *
 			"retaining managed daytona artifacts per runtime.deletionPolicy Orphan: %s", strings.Join(refs, ", "))
 		return nil
 	}
-	if st.ArtifactName != "" {
+	if deleteActive {
 		if err := r.deleteRuntimeArtifact(ctx, oi, provider.Artifact{Name: st.ArtifactName, ID: st.ArtifactID}); err != nil {
 			r.Recorder.Eventf(oi, corev1.EventTypeWarning, "RuntimeArtifactDeletionFailed",
-				"%v (set deletionPolicy: Orphan to skip)", err)
+				"%v (set spec.deletionPolicy: Orphan to skip all external cleanup)", err)
 			return err
 		}
 	}
 	for _, retired := range st.PreviousArtifacts {
 		if err := r.deleteRuntimeArtifact(ctx, oi, provider.Artifact{Name: retired.Name, ID: retired.ID}); err != nil {
 			r.Recorder.Eventf(oi, corev1.EventTypeWarning, "RuntimeArtifactDeletionFailed",
-				"%v (set deletionPolicy: Orphan to skip)", err)
+				"%v (set spec.deletionPolicy: Orphan to skip all external cleanup)", err)
 			return err
 		}
 	}
@@ -187,7 +198,7 @@ func (r *OpenInspectReconciler) cleanupProviderImages(ctx context.Context, oi *o
 	refs, found, err := cf.D1ImageBuildRefs(ctx, oi.Status.D1DatabaseID)
 	if err != nil {
 		r.Recorder.Eventf(oi, corev1.EventTypeWarning, "ProviderImageEvidenceReadFailed",
-			"%v (set deletionPolicy: Orphan to skip)", err)
+			"%v (set spec.deletionPolicy: Orphan to skip all external cleanup)", err)
 		return err
 	}
 	if !found {
@@ -198,7 +209,7 @@ func (r *OpenInspectReconciler) cleanupProviderImages(ctx context.Context, oi *o
 	for _, ref := range refs {
 		if err := r.deleteProviderImage(ctx, oi, ref); err != nil {
 			r.Recorder.Eventf(oi, corev1.EventTypeWarning, "ProviderImageDeletionFailed",
-				"image %s (%s): %v (set deletionPolicy: Orphan to skip)", ref.ImageID, ref.Provider, err)
+				"image %s (%s): %v (set spec.deletionPolicy: Orphan to skip all external cleanup)", ref.ImageID, ref.Provider, err)
 			return err
 		}
 		deleted++

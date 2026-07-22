@@ -15,6 +15,7 @@ import (
 	"iter"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -63,6 +64,14 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.TokenID == "" || cfg.TokenSecret == "" {
 		return nil, fmt.Errorf("modal: token id/secret are required")
 	}
+	// The SDK also consults ambient configuration the ClientParams cannot
+	// override (profiles, MODAL_SERVER_URL). Credentials are per-CR; refuse
+	// to run where ambient state could redirect them to another deployment.
+	for _, env := range []string{"MODAL_SERVER_URL", "MODAL_PROFILE", "MODAL_CONFIG_PATH"} {
+		if os.Getenv(env) != "" {
+			return nil, fmt.Errorf("modal: refusing to run with %s set: ambient modal configuration could redirect per-CR credentials", env)
+		}
+	}
 	if cfg.Environment == "" {
 		cfg.Environment = DefaultEnvironment
 	}
@@ -88,8 +97,14 @@ type session struct {
 func (p *Provider) newSession() (*session, error) {
 	s := &session{}
 	capture := func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		// Capture only the FIRST connection: every session's first RPC runs
+		// on the SDK's control-plane client, and later SDK versions may add
+		// side connections (input plane, command router) that must never
+		// hijack the raw control-plane calls.
 		s.connMu.Lock()
-		s.conn = cc
+		if s.conn == nil {
+			s.conn = cc
+		}
 		s.connMu.Unlock()
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}
@@ -233,6 +248,12 @@ func (p *Provider) webSuffix(rawURL string) (string, error) {
 	switch {
 	case slug == p.cfg.Workspace:
 		return "", nil
+	case p.cfg.Environment == DefaultEnvironment:
+		// The default environment publishes WITHOUT a suffix, so any extra
+		// slug content means the configured workspace is wrong (e.g.
+		// workspace "acme" against a real workspace "acme-corp") — never
+		// misread it as an environment suffix.
+		return "", fmt.Errorf("deployed app URL slug %q does not match spec workspace %q (the default environment publishes without a suffix): fix spec.sandbox.modal.workspace", slug, p.cfg.Workspace)
 	case strings.HasPrefix(slug, p.cfg.Workspace+"-"):
 		return strings.TrimPrefix(slug, p.cfg.Workspace+"-"), nil
 	default:

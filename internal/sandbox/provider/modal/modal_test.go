@@ -50,38 +50,43 @@ func TestConfigValidation(t *testing.T) {
 }
 
 func TestWebSuffixDerivation(t *testing.T) {
-	p, err := New(Config{TokenID: "i", TokenSecret: "s", Workspace: "dirien"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	cases := []struct {
-		url     string
-		want    string
-		wantErr bool
+		environment string
+		url         string
+		want        string
+		wantErr     bool
 	}{
-		{url: "https://dirien--open-inspect-api-health.modal.run", want: ""},
-		{url: "https://dirien-staging--open-inspect-api-health.modal.run", want: "staging"},
-		{url: "https://dirien-env-x--open-inspect-api-health.modal.run", want: "env-x"},
+		{environment: "main", url: "https://dirien--open-inspect-api-health.modal.run", want: ""},
+		{environment: "staging", url: "https://dirien-staging--open-inspect-api-health.modal.run", want: "staging"},
+		{environment: "envx", url: "https://dirien-env-x--open-inspect-api-health.modal.run", want: "env-x"},
 		// A different workspace is a configuration error, not a suffix.
-		{url: "https://other--open-inspect-api-health.modal.run", wantErr: true},
+		{environment: "main", url: "https://other--open-inspect-api-health.modal.run", wantErr: true},
 		// The other workspace merely PREFIXING ours must not pass either.
-		{url: "https://dirienx--open-inspect-api-health.modal.run", wantErr: true},
-		{url: "https://no-slug-separator.modal.run", wantErr: true},
+		{environment: "main", url: "https://dirienx--open-inspect-api-health.modal.run", wantErr: true},
+		// The DEFAULT environment publishes without a suffix, so a dashed
+		// slug means the workspace is wrong (e.g. real workspace
+		// "dirien-corp"), never an environment suffix.
+		{environment: "main", url: "https://dirien-corp--open-inspect-api-health.modal.run", wantErr: true},
+		{environment: "main", url: "https://no-slug-separator.modal.run", wantErr: true},
 	}
 	for _, tc := range cases {
+		p, err := New(Config{TokenID: "i", TokenSecret: "s", Workspace: "dirien", Environment: tc.environment})
+		if err != nil {
+			t.Fatal(err)
+		}
 		got, err := p.webSuffix(tc.url)
 		if tc.wantErr {
 			if err == nil {
-				t.Errorf("webSuffix(%q) = %q, want error", tc.url, got)
+				t.Errorf("webSuffix(%q, env %s) = %q, want error", tc.url, tc.environment, got)
 			}
 			continue
 		}
 		if err != nil {
-			t.Errorf("webSuffix(%q): %v", tc.url, err)
+			t.Errorf("webSuffix(%q, env %s): %v", tc.url, tc.environment, err)
 			continue
 		}
 		if got != tc.want {
-			t.Errorf("webSuffix(%q) = %q, want %q", tc.url, got, tc.want)
+			t.Errorf("webSuffix(%q, env %s) = %q, want %q", tc.url, tc.environment, got, tc.want)
 		}
 	}
 }

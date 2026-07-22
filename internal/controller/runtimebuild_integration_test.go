@@ -271,6 +271,91 @@ var _ = Describe("Managed sandbox runtime", func() {
 			To(Equal("prebuilt-base"))
 	})
 
+	It("retires the managed artifact when switching to an external snapshot", func() {
+		inspect = provider.ArtifactState{Phase: provider.ArtifactReady, ID: "snap-managed"}
+		oi := &openinspectv1alpha1.OpenInspect{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       daytonaSpec(""),
+		}
+		Expect(k8sClient.Create(ctx, oi)).To(Succeed())
+		Expect(reconcile()).To(Succeed())
+		managed := getOI().Status.SandboxRuntime.ArtifactName
+		Expect(managed).To(HavePrefix("oi-"))
+
+		// Pin an external snapshot: the managed artifact must be RETIRED for
+		// GC, never silently dropped (it would leak in Daytona forever).
+		oi = getOI()
+		oi.Spec.Sandbox.Daytona.BaseSnapshot = "prebuilt-base"
+		Expect(k8sClient.Update(ctx, oi)).To(Succeed())
+		Expect(reconcile()).To(Succeed())
+
+		st := getOI().Status.SandboxRuntime
+		Expect(st.Phase).To(Equal(openinspectv1alpha1.RuntimePhaseExternal))
+		Expect(st.ArtifactName).To(Equal("prebuilt-base"))
+		names := []string{}
+		for _, retired := range st.PreviousArtifacts {
+			names = append(names, retired.Name)
+		}
+		Expect(names).To(ContainElement(managed))
+	})
+
+	It("recovers when the artifact vanishes after a successful build", func() {
+		oi := &openinspectv1alpha1.OpenInspect{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+			Spec:       daytonaSpec(""),
+		}
+		Expect(k8sClient.Create(ctx, oi)).To(Succeed())
+		Expect(reconcile()).To(Succeed()) // Absent -> build job created
+
+		jobs := &batchv1.JobList{}
+		Expect(k8sClient.List(ctx, jobs, client.InNamespace(ns))).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1))
+		job := jobs.Items[0]
+		now := metav1.Now()
+		job.Status.StartTime = &now
+		job.Status.CompletionTime = &now
+		job.Status.Succeeded = 1
+		job.Status.Conditions = append(job.Status.Conditions,
+			batchv1.JobCondition{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue},
+			batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue})
+		Expect(k8sClient.Status().Update(ctx, &job)).To(Succeed())
+		inspect = provider.ArtifactState{Phase: provider.ArtifactReady, ID: "snap-1"}
+		Expect(reconcile()).To(Succeed())
+		Expect(getOI().Status.SandboxRuntime.Phase).To(Equal(openinspectv1alpha1.RuntimePhaseReady))
+
+		// The snapshot vanishes out of band while the succeeded Job (TTL 1h)
+		// still exists: the stale Job must be deleted so a rebuild can start
+		// immediately instead of waiting out the TTL.
+		inspect = provider.ArtifactState{Phase: provider.ArtifactAbsent}
+		Expect(reconcile()).To(Succeed())
+		Expect(getOI().Status.SandboxRuntime.Phase).To(Equal(openinspectv1alpha1.RuntimePhaseFailed))
+		Expect(k8sClient.List(ctx, jobs, client.InNamespace(ns))).To(Succeed())
+		for i := range jobs.Items {
+			Expect(jobs.Items[i].DeletionTimestamp.IsZero()).To(BeFalse(), "stale succeeded job must be deleted")
+		}
+
+		// With the stale Job gone, the next pass starts a fresh build.
+		for i := range jobs.Items {
+			_ = k8sClient.Delete(ctx, &jobs.Items[i], client.PropagationPolicy(metav1.DeletePropagationBackground))
+		}
+		Eventually(func() int {
+			fresh := &batchv1.JobList{}
+			_ = k8sClient.List(ctx, fresh, client.InNamespace(ns))
+			n := 0
+			for i := range fresh.Items {
+				if fresh.Items[i].DeletionTimestamp.IsZero() {
+					n++
+				}
+			}
+			return n
+		}).Should(BeZero())
+		Expect(reconcile()).To(Succeed())
+		Expect(getOI().Status.SandboxRuntime.Phase).To(Equal(openinspectv1alpha1.RuntimePhasePending))
+		Expect(k8sClient.List(ctx, jobs, client.InNamespace(ns))).To(Succeed())
+		Expect(jobs.Items).To(HaveLen(1))
+		Expect(jobSucceeded(&jobs.Items[0])).To(BeFalse())
+	})
+
 	It("adopts an already-existing remote artifact without a Job", func() {
 		inspect = provider.ArtifactState{Phase: provider.ArtifactReady, ID: "snap-pre"}
 		oi := &openinspectv1alpha1.OpenInspect{

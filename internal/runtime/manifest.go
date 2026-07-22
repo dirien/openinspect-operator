@@ -9,6 +9,7 @@ package runtime
 import (
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // Step is one named group of shell commands, executed in order.
@@ -140,10 +141,15 @@ func NewManifest(upstreamCommit string, files []File) *Manifest {
 	}
 }
 
+// loadOnce memoizes the embedded tree walk: the manifest is immutable for
+// the life of the binary and Load runs on the reconcile hot path.
+var loadOnce = sync.OnceValues(loadRuntimeFiles)
+
 // Load returns the canonical manifest built from the embedded pinned
-// upstream revision.
+// upstream revision. The returned Manifest shares the memoized file slice;
+// callers that mutate RuntimeFiles entries (tests) must copy first.
 func Load() (*Manifest, error) {
-	files, err := loadRuntimeFiles()
+	files, err := loadOnce()
 	if err != nil {
 		return nil, fmt.Errorf("load runtime files: %w", err)
 	}
