@@ -48,6 +48,12 @@ spec:
             # upstream app source; the tag follows the chart appVersion.
             - name: RELATED_IMAGE_MODAL_DEPLOY
               value: {{ .Values.controllerManager.container.modalDeployImage | default (printf "ghcr.io/dirien/openinspect-modal-deploy:v%s" .Chart.AppVersion) }}
+            # Release web images (one per provider), runtime-wired by the
+            # operator; used when spec.web.image is empty.
+            - name: RELATED_IMAGE_WEB_MODAL
+              value: {{ .Values.controllerManager.container.webImageModal | default (printf "ghcr.io/dirien/openinspect-web:v%s-modal" .Chart.AppVersion) }}
+            - name: RELATED_IMAGE_WEB_DAYTONA
+              value: {{ .Values.controllerManager.container.webImageDaytona | default (printf "ghcr.io/dirien/openinspect-web:v%s-daytona" .Chart.AppVersion) }}
             {{- range $key, $value := .Values.controllerManager.container.env }}
             - name: {{ $key }}
               value: {{ $value }}

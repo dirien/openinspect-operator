@@ -1,0 +1,57 @@
+# Release web image: the unmodified pinned upstream web app, built once per
+# release and provider, runtime-wired per deployment.
+#
+# Next.js bakes NEXT_PUBLIC_* into the bundles at build time. Baking the
+# deployment-specific WebSocket URL would force every installation to build
+# its own image, so this image bakes a unique PLACEHOLDER instead;
+# hack/web-entrypoint.sh substitutes it with $OI_WS_URL at container start.
+# The sandbox provider drives provider-specific UI and only has two
+# supported values, so it IS baked — one image variant per provider:
+#
+#   docker build -f Dockerfile.web --build-arg OI_PROVIDER=daytona \
+#     -t ghcr.io/dirien/openinspect-web:<tag>-daytona .
+#
+# Build context is this repository's root (the pinned upstream lives in
+# third_party/background-agents).
+
+FROM node:22-slim AS deps
+WORKDIR /app
+# npm ci resolves the whole workspace tree, so every workspace manifest has
+# to be present even though only web and shared are built.
+COPY third_party/background-agents/package.json third_party/background-agents/package-lock.json ./
+COPY third_party/background-agents/packages/control-plane/package.json packages/control-plane/
+COPY third_party/background-agents/packages/github-bot/package.json packages/github-bot/
+COPY third_party/background-agents/packages/linear-bot/package.json packages/linear-bot/
+COPY third_party/background-agents/packages/opencomputer-infra/package.json packages/opencomputer-infra/
+COPY third_party/background-agents/packages/shared/package.json packages/shared/
+COPY third_party/background-agents/packages/slack-bot/package.json packages/slack-bot/
+COPY third_party/background-agents/packages/web/package.json packages/web/
+RUN CI=1 npm ci --ignore-scripts --no-audit --no-fund
+
+FROM deps AS build
+ARG OI_PROVIDER
+RUN test -n "$OI_PROVIDER" || { echo "OI_PROVIDER build arg is required (modal|daytona)" >&2; exit 1; }
+ENV NEXT_PUBLIC_WS_URL=wss://oi-runtime-ws-url-placeholder.invalid \
+    NEXT_PUBLIC_SANDBOX_PROVIDER=$OI_PROVIDER
+COPY third_party/background-agents/packages/shared packages/shared
+COPY third_party/background-agents/packages/web packages/web
+# web resolves @open-inspect/shared through its built dist/.
+RUN npm run build -w @open-inspect/shared && npm run build -w @open-inspect/web
+
+FROM node:22-slim AS runner
+ENV NODE_ENV=production \
+    PORT=3000 \
+    HOSTNAME=0.0.0.0
+WORKDIR /app
+RUN groupadd --system --gid 1001 nodejs && useradd --system --uid 1001 --gid nodejs nextjs
+# next.config.ts sets output: "standalone" with the monorepo as the tracing
+# root, so the standalone tree mirrors the workspace layout. Files are owned
+# by the app user: the entrypoint rewrites the placeholder in place.
+COPY --from=build --chown=nextjs:nodejs /app/packages/web/.next/standalone ./
+COPY --from=build --chown=nextjs:nodejs /app/packages/web/.next/static ./packages/web/.next/static
+COPY --from=build --chown=nextjs:nodejs /app/packages/web/public ./packages/web/public
+COPY --chown=nextjs:nodejs hack/web-entrypoint.sh /usr/local/bin/web-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/web-entrypoint.sh
+USER nextjs
+EXPOSE 3000
+ENTRYPOINT ["/usr/local/bin/web-entrypoint.sh"]

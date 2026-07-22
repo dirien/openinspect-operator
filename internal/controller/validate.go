@@ -93,6 +93,14 @@ func validateSpec(oi *openinspectv1alpha1.OpenInspect) error {
 	if err := validateModalAppInputs(oi); err != nil {
 		return err
 	}
+	// The release ships web images only for the managed providers; anything
+	// else needs an explicit image.
+	if web := oi.Spec.Web; web != nil && web.Image == "" {
+		sb := oi.Spec.Sandbox
+		if sb == nil || (sb.Provider != providerModal && sb.Provider != providerDaytona) {
+			return fmt.Errorf("spec.web.image is required unless spec.sandbox.provider is a managed provider (modal, daytona)")
+		}
+	}
 	for _, w := range oi.Spec.Workers {
 		if len(w.Bindings.D1) > 0 && oi.Spec.D1 == nil {
 			return fmt.Errorf("worker %q has a d1 binding but spec.d1 is not set", w.Name)

@@ -75,6 +75,12 @@ spec:
           # upstream app source, Dockerfile.modal-deploy).
           - name: RELATED_IMAGE_MODAL_DEPLOY
             value: ghcr.io/dirien/openinspect-modal-deploy:latest
+          # Release web images (Dockerfile.web, one per provider); used when
+          # spec.web.image is empty and runtime-wired via OI_WS_URL.
+          - name: RELATED_IMAGE_WEB_MODAL
+            value: ghcr.io/dirien/openinspect-web:latest-modal
+          - name: RELATED_IMAGE_WEB_DAYTONA
+            value: ghcr.io/dirien/openinspect-web:latest-daytona
         ports: []
         securityContext:
           readOnlyRootFilesystem: true

@@ -91,6 +91,11 @@ type OpenInspectReconciler struct {
 	// (--modal-deploy-image flag / RELATED_IMAGE_MODAL_DEPLOY env); it
 	// carries the pinned Modal CLI and the pinned upstream app source.
 	ModalDeployImage string
+	// WebImageModal / WebImageDaytona are the release's provider-specific
+	// web images (--web-image-* flags / RELATED_IMAGE_WEB_* envs), used
+	// when spec.web.image is empty.
+	WebImageModal   string
+	WebImageDaytona string
 
 	// NewCF is swappable in tests; defaults to cfclient.New.
 	NewCF func(accountID, apiToken, baseURL string) *cfclient.Client
@@ -241,7 +246,7 @@ func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err != nil {
 		return r.failed(ctx, oi, openinspectv1alpha1.ConditionWorkers, "WorkersFailed", err)
 	}
-	if err := timed("web", func() error { return r.ensureWeb(ctx, oi) }); err != nil {
+	if err := timed("web", func() error { return r.ensureWeb(ctx, oi, cf) }); err != nil {
 		return r.failed(ctx, oi, openinspectv1alpha1.ConditionWeb, "WebFailed", err)
 	}
 	if err := timed("appsecrets", func() error { return r.ensureAppSecrets(ctx, oi, cf) }); err != nil {

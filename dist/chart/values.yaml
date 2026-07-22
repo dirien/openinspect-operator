@@ -18,6 +18,12 @@ controllerManager:
     # app source). Empty selects the release-matched
     # ghcr.io/dirien/openinspect-modal-deploy image.
     modalDeployImage: ""
+    # -- Release web image for provider modal (spec.web.image empty). Empty
+    # selects the release-matched ghcr.io/dirien/openinspect-web image.
+    webImageModal: ""
+    # -- Release web image for provider daytona (spec.web.image empty).
+    # Empty selects the release-matched ghcr.io/dirien/openinspect-web image.
+    webImageDaytona: ""
     args:
       - "--leader-elect"
       - "--metrics-bind-address=:8443"

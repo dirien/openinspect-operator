@@ -447,7 +447,13 @@ spec:
                     maxProperties: 128
                     type: object
                   image:
-                    description: Image is the container image of the web app.
+                    description: |-
+                      Image overrides the web app container image. Empty selects the
+                      release's web image for the CR's sandbox provider
+                      (ghcr.io/dirien/openinspect-web, one variant per provider); the
+                      operator wires the deployment-specific control-plane URLs into it at
+                      runtime (OI_WS_URL / CONTROL_PLANE_URL), so no per-deployment image
+                      build is needed.
                     type: string
                   port:
                     default: 3000
@@ -488,8 +494,6 @@ spec:
                       type: object
                     maxItems: 64
                     type: array
-                required:
-                - image
                 type: object
               workers:
                 items:

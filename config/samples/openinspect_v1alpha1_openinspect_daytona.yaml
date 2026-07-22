@@ -71,11 +71,11 @@ spec:
       # target: us
       apiKeySecretRef: {name: platform-secrets, key: daytonaApiKey}
   web:
-    image: open-inspect-web:daytona-ce2be05
+    # No image: the release's daytona web image deploys by default; the
+    # operator wires OI_WS_URL / CONTROL_PLANE_URL at runtime.
     replicas: 1
     port: 3000
     env:
-      CONTROL_PLANE_URL: https://open-inspect-control-plane-daytona.engin-diri.workers.dev
       NEXTAUTH_URL: http://localhost:3000
       GITHUB_CLIENT_ID: Iv23litA098xiR1uQwZ5
       ALLOWED_USERS: dirien

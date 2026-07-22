@@ -66,6 +66,7 @@ func main() {
 	var resyncInterval time.Duration
 	var runtimeBuilderImage string
 	var modalDeployImage string
+	var webImageModal, webImageDaytona string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -78,6 +79,12 @@ func main() {
 	flag.StringVar(&modalDeployImage, "modal-deploy-image", os.Getenv("RELATED_IMAGE_MODAL_DEPLOY"),
 		"Image run by modal-deploy Jobs (carries the pinned Modal CLI and upstream app source, "+
 			"built from Dockerfile.modal-deploy). Defaults to RELATED_IMAGE_MODAL_DEPLOY.")
+	flag.StringVar(&webImageModal, "web-image-modal", os.Getenv("RELATED_IMAGE_WEB_MODAL"),
+		"Release web image for provider modal, used when spec.web.image is empty "+
+			"(Dockerfile.web). Defaults to RELATED_IMAGE_WEB_MODAL.")
+	flag.StringVar(&webImageDaytona, "web-image-daytona", os.Getenv("RELATED_IMAGE_WEB_DAYTONA"),
+		"Release web image for provider daytona, used when spec.web.image is empty "+
+			"(Dockerfile.web). Defaults to RELATED_IMAGE_WEB_DAYTONA.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -208,6 +215,8 @@ func main() {
 		ResyncInterval:      resyncInterval,
 		RuntimeBuilderImage: runtimeBuilderImage,
 		ModalDeployImage:    modalDeployImage,
+		WebImageModal:       webImageModal,
+		WebImageDaytona:     webImageDaytona,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "OpenInspect")
 		os.Exit(1)

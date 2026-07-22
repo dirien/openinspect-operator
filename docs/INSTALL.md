@@ -22,7 +22,6 @@ hand, and you never create worker/migration ConfigMaps.
 | Anthropic API key | the coding agent inside sandboxes | [console.anthropic.com](https://console.anthropic.com/) |
 | **Either** Modal account + API token | Modal sandbox provider | [modal.com](https://modal.com/settings/tokens) |
 | **or** Daytona account + API key | Daytona sandbox provider | [app.daytona.io](https://app.daytona.io/) — key needs **Sandboxes: R/W/D** and **Snapshots: R/W/D** |
-| A web UI image for your deployment | `NEXT_PUBLIC_*` values are baked at build time by upstream's design | built from the pinned upstream `packages/web` (see [6](#6-web-ui-image)) |
 
 The only things the operator cannot automate are account signups and OAuth
 application registrations — everything else is the CR.
@@ -200,51 +199,23 @@ or your own Ingress.
 
 ## 6. Web UI image
 
-Upstream bakes `NEXT_PUBLIC_*` values into the web bundle at build time (in
-particular `NEXT_PUBLIC_WS_URL`, the control-plane WebSocket URL), so each
-deployment builds its own image from the pinned upstream source
-(`third_party/background-agents/packages/web`). Upstream ships no
-self-hosting Dockerfile; a standard Next.js standalone build works:
+Nothing to build: with `spec.web.image` empty, the operator deploys the
+release's web image for your provider
+(`ghcr.io/dirien/openinspect-web:<vX.Y.Z>-modal|daytona`, built from the
+pinned unmodified upstream source) and wires the deployment-specific URLs
+into it at container start (`OI_WS_URL`, `CONTROL_PLANE_URL`). Renaming or
+re-pointing a deployment is a rollout, not a rebuild.
 
-```dockerfile
-# Dockerfile.web — build from third_party/background-agents/
-FROM node:22-slim AS build
-ARG NEXT_PUBLIC_WS_URL
-ARG NEXT_PUBLIC_SANDBOX_PROVIDER
-WORKDIR /app
-COPY package.json package-lock.json ./
-COPY packages/web packages/web
-COPY packages/shared packages/shared
-COPY packages/*/package.json packages/
-RUN CI=1 npm ci --ignore-scripts && npm run build -w @open-inspect/shared
-ENV NEXT_PUBLIC_WS_URL=$NEXT_PUBLIC_WS_URL \
-    NEXT_PUBLIC_SANDBOX_PROVIDER=$NEXT_PUBLIC_SANDBOX_PROVIDER
-RUN npm run build -w @open-inspect/web
+You still provide the app-level runtime env shown in the samples
+(`NEXTAUTH_URL`, `GITHUB_CLIENT_ID`, `ALLOWED_USERS`) and `secretEnv`
+(`NEXTAUTH_SECRET`, `GITHUB_CLIENT_SECRET`, `INTERNAL_CALLBACK_SECRET`,
+`ANTHROPIC_API_KEY`); anything you set explicitly wins over injected
+values.
 
-FROM node:22-slim
-WORKDIR /app
-COPY --from=build /app/packages/web/.next/standalone ./
-COPY --from=build /app/packages/web/.next/static packages/web/.next/static
-COPY --from=build /app/packages/web/public packages/web/public
-EXPOSE 3000
-CMD ["node", "packages/web/server.js"]
-```
-
-```sh
-cd third_party/background-agents
-docker build -f ../../Dockerfile.web \
-  --build-arg NEXT_PUBLIC_WS_URL=wss://open-inspect-control-plane-<deploymentName>.<account-subdomain>.workers.dev \
-  --build-arg NEXT_PUBLIC_SANDBOX_PROVIDER=<modal|daytona> \
-  -t <registry>/open-inspect-web:<tag> .
-docker push <registry>/open-inspect-web:<tag>
-```
-
-Reference it in `spec.web.image`, and set the runtime env
-(`CONTROL_PLANE_URL`, `NEXTAUTH_URL`, `GITHUB_CLIENT_ID`, `ALLOWED_USERS`)
-plus `secretEnv` (`NEXTAUTH_SECRET`, `GITHUB_CLIENT_SECRET`,
-`INTERNAL_CALLBACK_SECRET`, `ANTHROPIC_API_KEY`) as shown in the samples.
-(Your workers.dev account subdomain is shown in the Cloudflare dashboard
-under Workers.)
+Set `spec.web.image` only to bring your own build (e.g. custom branding
+baked via `NEXT_PUBLIC_APP_NAME`); the operator then applies stricter pod
+hardening (read-only root filesystem, forced non-root uid) since your image
+does not need the startup URL rewrite.
 
 ## 7. Updates, teardown, and safety rails
 

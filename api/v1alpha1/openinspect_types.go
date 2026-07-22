@@ -336,8 +336,14 @@ type SandboxSpec struct {
 
 // WebSpec runs the web UI inside the cluster as a Deployment + Service.
 type WebSpec struct {
-	// Image is the container image of the web app.
-	Image string `json:"image"`
+	// Image overrides the web app container image. Empty selects the
+	// release's web image for the CR's sandbox provider
+	// (ghcr.io/dirien/openinspect-web, one variant per provider); the
+	// operator wires the deployment-specific control-plane URLs into it at
+	// runtime (OI_WS_URL / CONTROL_PLANE_URL), so no per-deployment image
+	// build is needed.
+	// +optional
+	Image string `json:"image,omitempty"`
 
 	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=0

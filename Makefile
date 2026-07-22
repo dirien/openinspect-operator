@@ -160,6 +160,14 @@ MODAL_DEPLOY_IMG ?= ghcr.io/dirien/openinspect-modal-deploy:dev
 docker-build-modal-deploy: ## Build the modal-deploy Job image (pinned Modal CLI + upstream app source).
 	$(CONTAINER_TOOL) build -f Dockerfile.modal-deploy -t ${MODAL_DEPLOY_IMG} .
 
+# One variant per provider (upstream bakes the provider into the client
+# bundle); the WebSocket URL is wired at runtime by the entrypoint.
+WEB_IMG ?= ghcr.io/dirien/openinspect-web:dev
+WEB_PROVIDER ?= daytona
+.PHONY: docker-build-web
+docker-build-web: ## Build the release web image (WEB_PROVIDER=modal|daytona).
+	$(CONTAINER_TOOL) build -f Dockerfile.web --build-arg OI_PROVIDER=${WEB_PROVIDER} -t ${WEB_IMG}-${WEB_PROVIDER} .
+
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}

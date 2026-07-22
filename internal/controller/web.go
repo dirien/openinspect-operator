@@ -15,12 +15,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	openinspectv1alpha1 "github.com/dirien/openinspect-operator/api/v1alpha1"
+	cfclient "github.com/dirien/openinspect-operator/internal/cloudflare"
 )
 
 // ensureWeb runs the web UI in-cluster as an owned Deployment + Service.
 // Owner references make cleanup automatic on CR deletion; removal from spec
-// is handled explicitly below.
-func (r *OpenInspectReconciler) ensureWeb(ctx context.Context, oi *openinspectv1alpha1.OpenInspect) error {
+// is handled explicitly below. With no explicit image, the release's web
+// image for the CR's provider is used and the operator wires the
+// deployment-specific control-plane URLs into it at runtime — a rename
+// rolls out new env instead of requiring an image rebuild.
+func (r *OpenInspectReconciler) ensureWeb(ctx context.Context, oi *openinspectv1alpha1.OpenInspect, cf *cfclient.Client) error {
 	name := oi.Name + "-web"
 	if oi.Spec.Web == nil {
 		for _, obj := range []client.Object{
@@ -45,7 +49,44 @@ func (r *OpenInspectReconciler) ensureWeb(ctx context.Context, oi *openinspectv1
 		port = 3000
 	}
 
-	env := make([]corev1.EnvVar, 0, len(web.Env)+len(web.SecretEnv))
+	image := web.Image
+	// The release image's entrypoint rewrites the baked WebSocket-URL
+	// placeholder in place at startup, which needs (a) the image's own user
+	// (files are owned by uid 1001) and (b) a writable root filesystem.
+	// User-supplied images keep the stricter defaults.
+	defaulted := image == ""
+	if defaulted {
+		var err error
+		if image, err = r.defaultWebImage(oi); err != nil {
+			return err
+		}
+	}
+
+	// The operator knows the control-plane URLs; inject them so the
+	// default image needs zero URL configuration. Explicit spec env wins.
+	injected := map[string]string{}
+	if sb := oi.Spec.Sandbox; sb != nil && (sb.Provider == providerModal || sb.Provider == providerDaytona) {
+		host, err := r.controlPlaneHost(ctx, oi, cf)
+		if err != nil {
+			return fmt.Errorf("derive control-plane host: %w", err)
+		}
+		injected["OI_WS_URL"] = "wss://" + host
+		injected["CONTROL_PLANE_URL"] = "https://" + host
+	}
+	explicit := map[string]bool{}
+	for k := range web.Env {
+		explicit[k] = true
+	}
+	for _, s := range web.SecretEnv {
+		explicit[s.Binding] = true
+	}
+
+	env := make([]corev1.EnvVar, 0, len(injected)+len(web.Env)+len(web.SecretEnv))
+	for _, k := range sortedKeys(injected) {
+		if !explicit[k] {
+			env = append(env, corev1.EnvVar{Name: k, Value: injected[k]})
+		}
+	}
 	for _, k := range sortedKeys(web.Env) {
 		env = append(env, corev1.EnvVar{Name: k, Value: web.Env[k]})
 	}
@@ -68,12 +109,19 @@ func (r *OpenInspectReconciler) ensureWeb(ctx context.Context, oi *openinspectv1
 		deploy.Spec.Selector = &metav1.LabelSelector{MatchLabels: labels}
 		deploy.Spec.Template.Labels = labels
 		runAsNonRoot, runAsUser := true, int64(1000)
-		noPrivEsc, roRootFS := false, true
-		deploy.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{
+		noPrivEsc := false
+		roRootFS := !defaulted
+		podSC := &corev1.PodSecurityContext{
 			RunAsNonRoot:   &runAsNonRoot,
-			RunAsUser:      &runAsUser,
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 		}
+		if !defaulted {
+			// Arbitrary user images get a forced non-root uid; the release
+			// image declares its own user, which must own its files for the
+			// startup rewrite.
+			podSC.RunAsUser = &runAsUser
+		}
+		deploy.Spec.Template.Spec.SecurityContext = podSC
 		// The read-only root filesystem needs a writable /tmp for typical web
 		// runtimes (Next.js et al.).
 		deploy.Spec.Template.Spec.Volumes = []corev1.Volume{{
@@ -91,7 +139,7 @@ func (r *OpenInspectReconciler) ensureWeb(ctx context.Context, oi *openinspectv1
 		}
 		deploy.Spec.Template.Spec.Containers = []corev1.Container{{
 			Name:  "web",
-			Image: web.Image,
+			Image: image,
 			Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: port}},
 			Env:   env,
 			SecurityContext: &corev1.SecurityContext{
@@ -151,4 +199,30 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// defaultWebImage resolves the release's web image for the CR's provider.
+// One variant exists per managed provider because the provider is baked
+// into the client bundle by upstream's design; the deployment-specific
+// WebSocket URL is wired at runtime by the image's entrypoint.
+func (r *OpenInspectReconciler) defaultWebImage(oi *openinspectv1alpha1.OpenInspect) (string, error) {
+	sb := oi.Spec.Sandbox
+	provider := ""
+	if sb != nil {
+		provider = sb.Provider
+	}
+	switch provider {
+	case providerModal:
+		if r.WebImageModal == "" {
+			return "", fmt.Errorf("no default web image configured for provider modal (set --web-image-modal / RELATED_IMAGE_WEB_MODAL) — or set spec.web.image")
+		}
+		return r.WebImageModal, nil
+	case providerDaytona:
+		if r.WebImageDaytona == "" {
+			return "", fmt.Errorf("no default web image configured for provider daytona (set --web-image-daytona / RELATED_IMAGE_WEB_DAYTONA) — or set spec.web.image")
+		}
+		return r.WebImageDaytona, nil
+	default:
+		return "", fmt.Errorf("spec.web.image is required: release web images exist only for the managed providers (modal, daytona), not %q", provider)
+	}
 }

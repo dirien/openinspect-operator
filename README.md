@@ -17,7 +17,7 @@ apply`, 13 `null_resource` script shims, `scripts/d1-migrate.sh`, and
 | Worker secrets | read from Kubernetes Secrets, uploaded as `secret_text` bindings |
 | Service bindings between workers | converge across reconcile passes — a binding to a not-yet-existing worker is retried until the target exists, so circular references (control-plane ↔ bots) need no two-phase apply |
 | Durable Object migrations | `new_sqlite_classes` declared automatically on first upload of a worker |
-| Web UI | runs **in-cluster** as an owned Deployment + Service (env from spec, secrets via `secretKeyRef`) |
+| Web UI | runs **in-cluster** as an owned Deployment + Service; `spec.web.image` empty deploys the **release's web image** for the CR's provider, with the control-plane URLs wired in at runtime (`OI_WS_URL`) — renames roll out env instead of requiring an image rebuild |
 | Worker bundles & D1 migrations | **embedded in the operator release**, built from the pinned upstream revision — no `worker-bundles` or `d1-migrations` ConfigMaps to create (both remain as development overrides) |
 | Sandbox providers | `spec.sandbox` selects **modal / daytona** (vercel / opencomputer scaffolding exists but is unsupported until the pinned upstream drives them); the operator injects that provider's vars and secret bindings into the control-plane worker (explicit worker values win) |
 | Provider base artifacts | **operator-managed by default**: for Daytona a digest-named base snapshot is built by an owned runtime-build Job from the canonical runtime manifest (`internal/runtime`, pinned toolchain + embedded `sandbox_runtime`); `spec.sandbox.daytona.baseSnapshot` remains the external override. Superseded artifacts are retained for a rollback grace period, then garbage-collected |
@@ -66,8 +66,7 @@ CI. The release also ships `ghcr.io/dirien/openinspect-sandbox-runtime`
 `spec.sandbox.runtime.image`).
 
 Out of scope (not automatable via APIs): GitHub/Slack/Linear/Google app
-registrations and the per-deployment web image builds (`NEXT_PUBLIC_*`
-values are baked in at build time by upstream's design).
+registrations.
 
 ## Custom resource
 
