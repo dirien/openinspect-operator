@@ -26,3 +26,16 @@ jobs:
       # silently drifting from config/crd is exactly the bug this catches.
       - name: Check generated files are committed
         run: make check-generated
+
+  check-upstream-pin:
+    name: third_party matches pinned upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      # Proves the committed third_party/background-agents tree byte-matches
+      # a fresh sync of the recorded upstream commit: hand-edits of pinned
+      # upstream source (EPIC1 D2) can never land silently.
+      - name: Verify pinned upstream tree
+        run: hack/sync-upstream.sh --verify

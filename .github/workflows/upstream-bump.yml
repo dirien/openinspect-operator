@@ -1,0 +1,45 @@
+name: Upstream bump
+
+# Weekly PR moving the pinned ColeMurray/background-agents revision to the
+# current upstream main. The PR only re-syncs third_party; CI on the PR runs
+# the version-pin parity tests and full suite, so a toolchain change upstream
+# fails the PR until versions.go (and the runtime digest golden) are updated
+# deliberately.
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Resolve upstream main
+        id: upstream
+        run: |
+          commit=$(git ls-remote https://github.com/ColeMurray/background-agents.git refs/heads/main | cut -f1)
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
+      - name: Sync pinned tree
+        run: hack/sync-upstream.sh "${{ steps.upstream.outputs.commit }}"
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@271a8d0340265f705b14b6d32b9829c1cb33d45e # v7.0.8
+        with:
+          branch: upstream-bump
+          commit-message: "chore: bump pinned upstream to ${{ steps.upstream.outputs.commit }}"
+          title: "chore: bump pinned upstream background-agents"
+          body: |
+            Automated re-sync of `third_party/background-agents` to upstream
+            `${{ steps.upstream.outputs.commit }}`.
+
+            Review checklist:
+            - [ ] `internal/runtime` version-pin parity tests pass (toolchain unchanged) or `versions.go` + digest golden updated deliberately
+            - [ ] embedded worker bundles rebuilt if worker sources changed
