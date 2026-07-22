@@ -14,6 +14,7 @@ func TestSandboxInjection(t *testing.T) {
 	cases := []struct {
 		name        string
 		sb          openinspectv1alpha1.SandboxSpec
+		status      openinspectv1alpha1.OpenInspectStatus
 		wantVars    map[string]string
 		wantSecrets []string
 	}{
@@ -30,7 +31,25 @@ func TestSandboxInjection(t *testing.T) {
 			wantSecrets: []string{"MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "MODAL_API_SECRET"},
 		},
 		{
-			name: "daytona",
+			name: "modal web suffix discovered from deployed app",
+			sb: openinspectv1alpha1.SandboxSpec{
+				Provider: "modal",
+				Modal: &openinspectv1alpha1.ModalSandboxSpec{
+					Workspace: "dirien", Environment: "staging",
+					TokenIDSecretRef: ref("id"), TokenSecretSecretRef: ref("tok"), APISecretSecretRef: ref("api"),
+				},
+			},
+			status: openinspectv1alpha1.OpenInspectStatus{
+				ModalApp: &openinspectv1alpha1.ModalAppStatus{WebSuffix: "staging"},
+			},
+			wantVars: map[string]string{
+				"SANDBOX_PROVIDER": "modal", "MODAL_WORKSPACE": "dirien",
+				"MODAL_ENVIRONMENT": "staging", "MODAL_ENVIRONMENT_WEB_SUFFIX": "staging",
+			},
+			wantSecrets: []string{"MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "MODAL_API_SECRET"},
+		},
+		{
+			name: "daytona external snapshot",
 			sb: openinspectv1alpha1.SandboxSpec{
 				Provider:            "daytona",
 				InactivityTimeoutMS: 600000,
@@ -43,6 +62,24 @@ func TestSandboxInjection(t *testing.T) {
 				"SANDBOX_PROVIDER": "daytona", "DAYTONA_BASE_SNAPSHOT": "snap-1",
 				"DAYTONA_API_URL": "https://app.daytona.io/api", "DAYTONA_TARGET": "eu",
 				"SANDBOX_INACTIVITY_TIMEOUT_MS": "600000",
+			},
+			wantSecrets: []string{"DAYTONA_API_KEY"},
+		},
+		{
+			name: "daytona managed snapshot from status",
+			sb: openinspectv1alpha1.SandboxSpec{
+				Provider: "daytona",
+				Daytona: &openinspectv1alpha1.DaytonaSandboxSpec{
+					APIURL:          "https://app.daytona.io/api",
+					APIKeySecretRef: ref("key"),
+				},
+			},
+			status: openinspectv1alpha1.OpenInspectStatus{
+				SandboxRuntime: &openinspectv1alpha1.SandboxRuntimeStatus{ArtifactName: "oi-abc-123456789012"},
+			},
+			wantVars: map[string]string{
+				"SANDBOX_PROVIDER": "daytona", "DAYTONA_BASE_SNAPSHOT": "oi-abc-123456789012",
+				"DAYTONA_API_URL": "https://app.daytona.io/api",
 			},
 			wantSecrets: []string{"DAYTONA_API_KEY"},
 		},
@@ -81,7 +118,11 @@ func TestSandboxInjection(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			vars, secrets := sandboxInjection(&tc.sb)
+			oi := &openinspectv1alpha1.OpenInspect{
+				Spec:   openinspectv1alpha1.OpenInspectSpec{Sandbox: &tc.sb},
+				Status: tc.status,
+			}
+			vars, secrets := sandboxInjection(oi)
 			for k, v := range tc.wantVars {
 				if vars[k] != v {
 					t.Errorf("var %s = %q, want %q", k, vars[k], v)
@@ -208,5 +249,26 @@ func TestValidateSandbox(t *testing.T) {
 		Modal:    &openinspectv1alpha1.ModalSandboxSpec{Workspace: "w"},
 	}, workers); err != nil {
 		t.Errorf("valid spec rejected: %v", err)
+	}
+	if err := validateSandbox(&openinspectv1alpha1.SandboxSpec{
+		Provider: "vercel",
+		Vercel:   &openinspectv1alpha1.VercelSandboxSpec{ProjectID: "p"},
+		Runtime:  &openinspectv1alpha1.SandboxRuntimeSpec{},
+	}, workers); err == nil {
+		t.Error("runtime section on an unmanaged provider must fail")
+	}
+	if err := validateSandbox(&openinspectv1alpha1.SandboxSpec{
+		Provider: "modal",
+		Modal:    &openinspectv1alpha1.ModalSandboxSpec{Workspace: "w"},
+		Runtime:  &openinspectv1alpha1.SandboxRuntimeSpec{Image: "ghcr.io/x/y:z"},
+	}, workers); err == nil {
+		t.Error("runtime.image with provider modal must fail (upstream app owns its image)")
+	}
+	if err := validateSandbox(&openinspectv1alpha1.SandboxSpec{
+		Provider: "daytona",
+		Daytona:  &openinspectv1alpha1.DaytonaSandboxSpec{APIURL: "https://d"},
+		Runtime:  &openinspectv1alpha1.SandboxRuntimeSpec{Image: "ghcr.io/x/y:z"},
+	}, workers); err != nil {
+		t.Errorf("managed daytona with runtime image override rejected: %v", err)
 	}
 }

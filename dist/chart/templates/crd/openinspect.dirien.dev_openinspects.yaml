@@ -235,15 +235,15 @@ spec:
                         type: string
                       baseSnapshot:
                         description: |-
-                          BaseSnapshot is the name of a prebuilt Daytona snapshot containing the
-                          sandbox runtime.
+                          BaseSnapshot names an externally owned, prebuilt Daytona snapshot to
+                          use as-is. Empty means the operator builds and manages the base
+                          snapshot from the release's bundled runtime.
                         type: string
                       target:
                         type: string
                     required:
                     - apiKeySecretRef
                     - apiUrl
-                    - baseSnapshot
                     type: object
                   inactivityTimeoutMs:
                     description: InactivityTimeoutMS stops idle sandboxes after this
@@ -252,9 +252,9 @@ spec:
                     type: integer
                   modal:
                     description: |-
-                      ModalSandboxSpec configures the Modal sandbox provider. The Modal app
-                      itself is deployed with `modal deploy` (CLI-only upstream); the operator
-                      wires the control plane to it.
+                      ModalSandboxSpec configures the Modal sandbox provider. The operator
+                      deploys the pinned upstream Modal app itself (modal-deploy Job) and
+                      discovers its endpoints; nothing endpoint-shaped is configured here.
                     properties:
                       apiSecretSecretRef:
                         description: SecretKeyRef selects a key of a Secret in the
@@ -271,16 +271,8 @@ spec:
                       environment:
                         default: main
                         description: |-
-                          Environment is the Modal environment NAME the app is deployed in.
-                          Deletion cleanup resolves the app by this name, so it must match the
-                          environment used with `modal deploy` even when environmentWebSuffix
-                          carries the URL suffix.
-                        type: string
-                      environmentWebSuffix:
-                        description: |-
-                          EnvironmentWebSuffix overrides the suffix embedded in the app's
-                          *.modal.run URLs when it differs from the environment name. It never
-                          selects the environment itself — set environment for that.
+                          Environment is the Modal environment NAME the app is deployed in and
+                          resolved from during cleanup.
                         type: string
                       tokenIdSecretRef:
                         description: SecretKeyRef selects a key of a Secret in the
@@ -362,6 +354,39 @@ spec:
                     - vercel
                     - opencomputer
                     type: string
+                  runtime:
+                    description: Runtime tunes the operator-managed provider base
+                      artifact.
+                    properties:
+                      deletionPolicy:
+                        default: Delete
+                        description: |-
+                          DeletionPolicy controls whether managed artifacts are deleted with
+                          the CR. Orphan retains them and records their references in status
+                          and events before the finalizer is removed.
+                        enum:
+                        - Delete
+                        - Orphan
+                        type: string
+                      image:
+                        description: |-
+                          Image overrides the container base the managed artifact builds FROM
+                          (e.g. a pinned ghcr.io/dirien/openinspect-sandbox-runtime tag). Empty
+                          means the release's bundled runtime recipe, built from its base image.
+                        maxLength: 512
+                        type: string
+                      updatePolicy:
+                        default: OnUpgrade
+                        description: |-
+                          UpdatePolicy controls when the managed artifact is rebuilt:
+                          OnUpgrade rebuilds whenever the release's runtime digest changes;
+                          Never keeps the current artifact (the reference still flips if one
+                          with the current digest already exists).
+                        enum:
+                        - OnUpgrade
+                        - Never
+                        type: string
+                    type: object
                   vercel:
                     description: |-
                       VercelSandboxSpec configures the Vercel sandbox provider. The control
@@ -737,6 +762,35 @@ spec:
                 description: KVNamespaceIDs maps logical KV names to Cloudflare namespace
                   IDs.
                 type: object
+              modalApp:
+                description: ModalApp records the operator-deployed upstream Modal
+                  app.
+                properties:
+                  appId:
+                    type: string
+                  deployedSourceRevision:
+                    description: DeployedSourceRevision is the upstream commit the
+                      deploy Job ran.
+                    type: string
+                  healthUrl:
+                    description: HealthURL is the discovered api-health endpoint of
+                      the deployed app.
+                    type: string
+                  lastDeployTime:
+                    format: date-time
+                    type: string
+                  secretsHash:
+                    description: |-
+                      SecretsHash fingerprints the Modal secret inputs last converged
+                      (HMAC-keyed; never reversible to values).
+                    type: string
+                  webSuffix:
+                    description: |-
+                      WebSuffix is the environment web suffix discovered from the deployed
+                      endpoints ("" for the default environment); it is what the operator
+                      injects as MODAL_ENVIRONMENT_WEB_SUFFIX.
+                    type: string
+                type: object
               observedGeneration:
                 format: int64
                 type: integer
@@ -746,6 +800,56 @@ spec:
                 description: |-
                   R2Buckets maps logical bucket names to full Cloudflare bucket names, so
                   deletion works from observed state even after spec edits.
+                type: object
+              sandboxRuntime:
+                description: SandboxRuntime records the managed provider base artifact.
+                properties:
+                  artifactId:
+                    type: string
+                  artifactName:
+                    description: |-
+                      ArtifactName/ArtifactID identify the remote artifact (e.g. the
+                      Daytona snapshot). The name embeds the digest, so a changed bundle
+                      is a new artifact, never a mutation.
+                    type: string
+                  digest:
+                    type: string
+                  lastBuildTime:
+                    format: date-time
+                    type: string
+                  observedGeneration:
+                    format: int64
+                    type: integer
+                  phase:
+                    type: string
+                  previousArtifacts:
+                    description: |-
+                      PreviousArtifacts are superseded managed artifacts retained for the
+                      rollback grace period before garbage collection.
+                    items:
+                      description: RetiredArtifact is a superseded managed artifact
+                        awaiting GC.
+                      properties:
+                        id:
+                          type: string
+                        name:
+                          type: string
+                        retiredAt:
+                          format: date-time
+                          type: string
+                      required:
+                      - name
+                      - retiredAt
+                      type: object
+                    maxItems: 10
+                    type: array
+                  provider:
+                    type: string
+                  sourceRevision:
+                    description: |-
+                      SourceRevision is the pinned upstream commit the artifact was built
+                      from; Digest is the canonical runtime bundle digest (sha256:...).
+                    type: string
                 type: object
               workers:
                 additionalProperties:

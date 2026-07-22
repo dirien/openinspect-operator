@@ -10,8 +10,11 @@ import (
 
 // sandboxInjection derives the vars and secret bindings the selected sandbox
 // provider requires on the control-plane worker. The names match what the
-// upstream control plane reads from its environment.
-func sandboxInjection(sb *openinspectv1alpha1.SandboxSpec) (vars map[string]string, secrets []openinspectv1alpha1.WorkerSecret) {
+// upstream control plane reads from its environment. Managed-artifact values
+// (the Daytona base snapshot, the Modal environment web suffix) come from
+// status: the operator built or discovered them, the user never supplies them.
+func sandboxInjection(oi *openinspectv1alpha1.OpenInspect) (vars map[string]string, secrets []openinspectv1alpha1.WorkerSecret) {
+	sb := oi.Spec.Sandbox
 	vars = map[string]string{"SANDBOX_PROVIDER": sb.Provider}
 	if sb.InactivityTimeoutMS > 0 {
 		vars["SANDBOX_INACTIVITY_TIMEOUT_MS"] = strconv.FormatInt(sb.InactivityTimeoutMS, 10)
@@ -30,14 +33,18 @@ func sandboxInjection(sb *openinspectv1alpha1.SandboxSpec) (vars map[string]stri
 		m := sb.Modal
 		set("MODAL_WORKSPACE", m.Workspace)
 		set("MODAL_ENVIRONMENT", m.Environment)
-		set("MODAL_ENVIRONMENT_WEB_SUFFIX", m.EnvironmentWebSuffix)
+		// Discovered from the deployed app's endpoints, not configured: the
+		// operator deploys the app and records the suffix in status.
+		if app := oi.Status.ModalApp; app != nil {
+			set("MODAL_ENVIRONMENT_WEB_SUFFIX", app.WebSuffix)
+		}
 		sec("MODAL_TOKEN_ID", m.TokenIDSecretRef)
 		sec("MODAL_TOKEN_SECRET", m.TokenSecretSecretRef)
 		sec("MODAL_API_SECRET", m.APISecretSecretRef)
 	case "daytona":
 		d := sb.Daytona
 		set("DAYTONA_API_URL", d.APIURL)
-		set("DAYTONA_BASE_SNAPSHOT", d.BaseSnapshot)
+		set("DAYTONA_BASE_SNAPSHOT", daytonaSnapshotName(oi))
 		set("DAYTONA_TARGET", d.Target)
 		sec("DAYTONA_API_KEY", d.APIKeySecretRef)
 	case "vercel":
@@ -64,6 +71,20 @@ func sandboxInjection(sb *openinspectv1alpha1.SandboxSpec) (vars map[string]stri
 	return vars, secrets
 }
 
+// daytonaSnapshotName returns the base snapshot the control plane must boot
+// sandboxes from: the explicit external reference when configured, otherwise
+// the managed artifact recorded in status (empty until its first build
+// finishes).
+func daytonaSnapshotName(oi *openinspectv1alpha1.OpenInspect) string {
+	if d := oi.Spec.Sandbox.Daytona; d != nil && d.BaseSnapshot != "" {
+		return d.BaseSnapshot
+	}
+	if rt := oi.Status.SandboxRuntime; rt != nil {
+		return rt.ArtifactName
+	}
+	return ""
+}
+
 // applySandbox merges the provider injection into the target worker spec.
 // Explicit values on the worker win; injection only fills gaps.
 func applySandbox(oi *openinspectv1alpha1.OpenInspect, w openinspectv1alpha1.WorkerSpec) openinspectv1alpha1.WorkerSpec {
@@ -75,7 +96,7 @@ func applySandbox(oi *openinspectv1alpha1.OpenInspect, w openinspectv1alpha1.Wor
 		return w
 	}
 
-	vars, secrets := sandboxInjection(sb)
+	vars, secrets := sandboxInjection(oi)
 
 	// Cloudflare binding names share one namespace across kinds, so explicit
 	// worker values suppress injected ones by NAME, var or secret alike.
@@ -139,14 +160,17 @@ func validateSandbox(sb *openinspectv1alpha1.SandboxSpec, workers map[string]boo
 			return fmt.Errorf("sandbox.%s is set but provider is %q", s.field, sb.Provider)
 		}
 	}
-	// Deletion cleanup resolves the Modal app by environment NAME while the
-	// runtime only uses the web SUFFIX in URLs — a suffix on the defaulted
-	// "main" environment works at runtime but makes cleanup look in the wrong
-	// environment (silently leaking the real app, or stopping a stranger's).
-	if m := sb.Modal; m != nil && m.EnvironmentWebSuffix != "" &&
-		modalEnvironment(m) == modalDefaultEnvironment && m.EnvironmentWebSuffix != modalDefaultEnvironment {
-		return fmt.Errorf("sandbox.modal.environmentWebSuffix %q is set while environment is %q: set spec.sandbox.modal.environment to the Modal environment name the app is deployed in",
-			m.EnvironmentWebSuffix, modalEnvironment(m))
+	if rt := sb.Runtime; rt != nil {
+		// Managed base artifacts exist only for the providers the pinned
+		// upstream revision actually drives (EPIC1 D3).
+		if sb.Provider != providerModal && sb.Provider != providerDaytona {
+			return fmt.Errorf("sandbox.runtime is only supported for the managed providers (modal, daytona), not %q", sb.Provider)
+		}
+		// The Modal base image is defined inside the unmodified upstream app
+		// (EPIC1 D2); there is nothing an image override could apply to.
+		if rt.Image != "" && sb.Provider == providerModal {
+			return fmt.Errorf("sandbox.runtime.image cannot be set for provider modal: the base image is defined by the upstream Modal app")
+		}
 	}
 	return nil
 }

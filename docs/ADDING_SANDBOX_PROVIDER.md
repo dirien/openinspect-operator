@@ -5,19 +5,35 @@
 This guide describes the work required to add a sandbox provider to the
 OpenInspect operator. A provider is not considered supported merely because
 its name is accepted by the CRD or its credentials are injected into a
-Cloudflare Worker. Support means the operator can manage the provider safely
-through the complete resource lifecycle.
+Cloudflare Worker. Support means the operator can install the provider's
+base artifacts and finalize its resources safely through the complete CR
+lifecycle.
 
 The only fully supported providers today are:
 
-| Provider | Configuration | Sandbox cleanup | App/base-resource cleanup |
-|---|---|---|---|
-| Modal | Supported | Supported through the Modal Go SDK | Modal app stopped through Modal's authenticated API |
-| Daytona | Supported | Supported through the Daytona Go SDK | Sandboxes deleted using D1-backed ownership evidence |
+| Provider | Configuration | Base artifact | Sandbox cleanup | App/base-resource cleanup |
+|---|---|---|---|---|
+| Modal | Supported | Built by the deployed upstream app | Modal Go SDK | App deployed by the modal-deploy Job, stopped through Modal's authenticated API |
+| Daytona | Supported | Managed snapshot built by the runtime-build Job (Daytona Go SDK) | Daytona Go SDK with D1-backed ownership evidence | Managed snapshot deleted on CR deletion |
 
 The API currently contains some Vercel and OpenComputer configuration
-scaffolding. These providers must not be advertised as supported until they
-satisfy the definition of done in this document.
+scaffolding. These providers must not be advertised as supported until the
+pinned upstream revision actually drives them and they satisfy the
+definition of done in this document (EPIC1 D3).
+
+## What the operator is (and is not)
+
+The operator is an **installer and lifecycle manager for unmodified
+upstream** ([EPIC1.md](EPIC1.md) D1, D4). Upstream's control plane makes all
+provider calls at runtime — creating, snapshotting, resuming, and stopping
+session sandboxes. The operator:
+
+- builds, inspects, and deletes provider **base artifacts**;
+- deploys provider-side applications where upstream requires one (Modal);
+- terminates **owned** sandboxes during finalization;
+- never sits in the session path and never proxies provider APIs.
+
+There is no operator-owned sandbox API. Do not design one.
 
 ## Non-negotiable implementation rules
 
@@ -26,8 +42,13 @@ Every new provider integration must follow these rules:
 - Implement provider operations in this repository using an official Go SDK
   or a typed Go HTTP client.
 - Do not use Terraform, provider CLIs, shell commands, or subprocesses.
+  **The single scoped exception (EPIC1 D5)** is the operator-owned
+  modal-deploy Job: Modal Functions cannot be deployed through the Go SDK,
+  so that Job runs the pinned Modal CLI against the pinned upstream source.
+  Nothing else may shell out, and no new provider may claim this exception
+  without an equivalent hard SDK limitation recorded in EPIC1.
 - Do not patch or require changes to the upstream
-  `ColeMurray/background-agents` repository.
+  `ColeMurray/background-agents` repository (EPIC1 D2).
 - Do not depend on private HTTP endpoints added to a local upstream checkout.
 - Never log provider tokens, request environments, sandbox environment
   variables, or Secret values.
@@ -39,83 +60,58 @@ Every new provider integration must follow these rules:
 - Make `spec.deletionPolicy: Orphan` the only way to intentionally skip
   external cleanup.
 
-## What “operator-managed” means
-
-The target architecture is defined in [EPIC1.md](EPIC1.md). Provider calls
-will be made by the operator-owned `sandbox-api`, using adapters implemented
-in this repository. Cloudflare Workers will call that API and will not receive
-provider credentials.
-
-Modal and Daytona currently have a compatibility path in which the upstream
-control-plane Worker creates sandboxes while the operator owns finalization.
-Do not copy that split ownership as the permanent design for a new provider.
-A new provider should implement the managed adapter and `sandbox-api` path.
-
-If a provider must temporarily use the compatibility path, the pinned,
-unmodified upstream control plane must already support it. Otherwise, complete
-the operator-owned `sandbox-api` work first. Modifying upstream is not an
-acceptable integration strategy.
-
 ## Required provider capabilities
 
 Before writing code, make a capability matrix for the provider. Record the
 SDK or API operation used for every row and identify unsupported operations.
+Session-sandbox lifecycle (create, restore, resume, snapshot, stop) is
+**upstream's** concern: verify the pinned upstream control plane drives the
+provider, but do not build operator code for it.
 
 | Capability | Requirement |
 |---|---|
 | Authentication | Credentials can be supplied directly to an SDK/client without global process state |
 | Base artifact | Build, find, inspect, version, and delete an image, snapshot, or template |
-| Create | Create a sandbox from the selected base artifact |
-| Restore | Restore or recreate a sandbox from a snapshot |
-| Resume | Resume a stopped or paused sandbox, or document an idempotent recreate equivalent |
-| Execute/bootstrap | Start the OpenInspect runtime without a provider CLI |
-| Snapshot | Create and inspect a filesystem snapshot |
-| Stop/terminate | Stop a sandbox idempotently |
 | List | List sandboxes using ownership metadata or safely filter them locally |
-| Delete | Delete sandboxes and provider artifacts idempotently |
-| Metadata | Attach and retrieve OpenInspect ownership labels/tags |
+| Terminate | Terminate/delete a sandbox idempotently (finalization only) |
+| Metadata | Retrieve the ownership labels upstream attaches to sandboxes |
 | State | Distinguish absent, pending, ready, failed, and unknown states |
 | Pagination | Traverse all pages with a bounded safety limit |
 | Rate limiting | Expose retry information without busy-looping |
 
-If the provider cannot attach and query ownership metadata, it is not safe for
-managed multi-tenant cleanup without a separate durable ownership index.
+If the provider cannot attach and query ownership metadata, it is not safe
+for managed multi-tenant cleanup without a separate durable ownership index.
 
 ## Ownership contract
 
-Every resource created for a CR should carry these values, using the closest
-provider equivalent to labels or tags:
+Unmodified upstream labels every sandbox it creates with:
 
 ```text
-openinspect.uid
-openinspect.namespace
-openinspect.name
-openinspect.session_id
-openinspect.sandbox_id
-openinspect.runtime_digest
+openinspect_framework=open-inspect
+openinspect_session_id=<session id>
 ```
 
-The CR UID is the primary tenant boundary. Namespace and name are useful for
-operators, but are not sufficient because they can be reused after deletion.
-
-For compatibility with sandboxes created by older control-plane bundles,
-Daytona intersects the provider's `openinspect_session_id` label with IDs from
-the CR-owned D1 `sessions` table. This is a migration fallback, not the ideal
-ownership model. Never delete resources using only a shared marker such as
-`openinspect_framework=open-inspect`.
+`openinspect_framework` alone is never ownership evidence — every
+Open-Inspect installation shares it. Ownership is established permanently
+(EPIC1 D8) by intersecting the provider's `openinspect_session_id` labels
+with the session IDs read from the **CR-owned D1 `sessions` table**. This is
+not a migration fallback; unmodified upstream cannot label sandboxes with
+the CR UID, so the D1 intersection is the design.
 
 The cleanup order must preserve ownership evidence:
 
-1. Read durable ownership records.
-2. List and delete owned provider sandboxes.
-3. Delete owned provider images, snapshots, templates, apps, and other shared
-   resources when no live CR still uses them.
-4. Delete the Cloudflare Worker and D1 database.
-5. Remove the Kubernetes finalizer.
+1. Delete the Cloudflare Workers (stops new sessions and new sandboxes).
+2. Read session IDs from the CR-owned D1 database.
+3. List and terminate owned provider sandboxes.
+4. Delete provider repository/environment images and the managed base
+   artifact; stop the deployed provider app when no live CR still uses it.
+5. Delete KV, R2, and D1 (D1 last — it is the ownership evidence).
+6. Remove the Kubernetes finalizer only after confirmed cleanup.
 
 If ownership cannot be proven, fail closed. Return an error, emit a warning
 Event, retain the finalizer, and require an explicit `Orphan` policy or an
-operator-approved recovery procedure.
+operator-approved recovery procedure. A network failure must never be
+interpreted as successful deletion.
 
 ## Implementation procedure
 
@@ -158,10 +154,12 @@ Then:
 - add the provider to the `SandboxSpec.Provider` kubebuilder enum;
 - add exactly one optional provider section to `SandboxSpec`;
 - add defaults and validation markers where the provider has stable limits;
-- avoid making a manually prebuilt image or snapshot mandatory for the
-  managed path;
-- add runtime status and `metav1.Condition` values if the provider introduces
-  an asynchronous artifact build.
+- make the managed base artifact the default: an **empty** artifact
+  reference means the operator builds and manages it, an explicit reference
+  means it is externally owned and used as-is (EPIC1 section 4). Never make
+  a manually prebuilt artifact mandatory;
+- provider app endpoints belong in **status**, discovered by the operator —
+  never in spec.
 
 Do not edit generated CRDs or `zz_generated` files manually. Run:
 
@@ -181,33 +179,23 @@ Update `internal/controller/sandbox.go` so:
 - unsupported or mutually exclusive options produce an `InvalidSpec`
   condition rather than repeated API retries.
 
-Add table-driven tests to `internal/controller/sandbox_test.go` for:
-
-- valid minimal configuration;
-- missing provider section;
-- mismatched provider section;
-- multiple provider sections;
-- missing Secret references or required provider options;
-- defaulted optional fields.
+Add table-driven tests to `internal/controller/sandbox_test.go`.
 
 ### 4. Watch every referenced Secret
 
 Add all provider `SecretKeyRef` fields to `referencesSecret` in
-`internal/controller/watches.go`. A Secret update must enqueue every CR in the
-same namespace that references it.
+`internal/controller/watches.go`, with tests in
+`internal/controller/watches_test.go`. Never grant cross-namespace Secret
+access.
 
-Add tests to `internal/controller/watches_test.go` covering positive and
-negative matches. Never grant cross-namespace Secret access.
+### 5. Implement the provider artifact adapter
 
-### 5. Implement the managed provider adapter
-
-Implement the shared provider lifecycle described in EPIC 1 under:
+Implement the shared artifact-and-finalization lifecycle from EPIC1
+section 5 under:
 
 ```text
 internal/sandbox/provider/<provider>/
 ```
-
-The adapter must cover:
 
 ```go
 type Provider interface {
@@ -215,59 +203,46 @@ type Provider interface {
 	InspectBaseArtifact(context.Context, Artifact) (ArtifactState, error)
 	DeleteBaseArtifact(context.Context, Artifact) error
 
-	CreateSandbox(context.Context, CreateRequest) (Sandbox, error)
-	RestoreSandbox(context.Context, RestoreRequest) (Sandbox, error)
-	SnapshotSandbox(context.Context, SnapshotRequest) (Snapshot, error)
-	ResumeSandbox(context.Context, ResumeRequest) (Sandbox, error)
-	StopSandbox(context.Context, StopRequest) error
-	DeleteSnapshot(context.Context, string) error
+	// Finalization only (EPIC1 D4). Ownership per D8.
 	ListOwnedSandboxes(context.Context, OwnerMetadata) ([]Sandbox, error)
+	TerminateSandbox(context.Context, string) error
 }
 ```
 
-Keep provider-specific API types inside the adapter. The controller and
-`sandbox-api` should consume normalized types and must not depend on raw SDK
-responses.
+Keep provider-specific API types inside the adapter; the controller
+consumes normalized types and must not depend on raw SDK responses. There
+is deliberately no session-sandbox lifecycle in this interface.
 
-If the provider builds base artifacts asynchronously, reconcile an owned
-Kubernetes Job as described in EPIC 1. Do not block a reconciliation worker
-for the full remote build duration.
+### 6. Run builds asynchronously
 
-### 6. Wire sandbox-api creation and credentials
+Remote artifact builds must not block reconciliation. The controller
+creates owned Kubernetes Jobs named from the runtime digest
+(`internal/controller/runtimebuild.go`, `cmd/runtime-builder`):
 
-For the managed path:
+- the runtime-build Job builds the deterministically named artifact via the
+  Go SDK / typed HTTP and exits successfully only after the remote artifact
+  is usable;
+- the modal-deploy Job (Modal only, D5) deploys the unmodified pinned
+  upstream Modal app with the pinned Modal CLI; the controller then
+  health-checks the endpoints and records them in status;
+- rollout follows EPIC1 D6: build the new digest-named artifact, flip the
+  reference, retain the previous artifact for a grace period, then delete
+  it. No blue/green, no smoke-test sandboxes.
 
-- register the adapter in `cmd/sandbox-api`;
-- mount or project only the selected provider's credentials;
-- disable the pod's Kubernetes service-account token;
-- keep provider credentials out of the Cloudflare Worker;
-- expose the same provider-neutral `/v1` request and response contract;
-- return normalized retryable, terminal, conflict, and not-found errors;
-- include CR UID and session ownership metadata on every create operation.
+### 7. Wire the control-plane injection
 
-The provider must work through any supported external exposure mode: standard
-Ingress, externally managed URL, or optional Gateway API. It must not depend
-on a specific ingress vendor.
-
-### 7. Add compatibility injection only when required
-
-If the clean pinned upstream control plane already supports the provider and
-a temporary compatibility path is necessary, add its plain variables and
-Secret bindings to `sandboxInjection` in
-`internal/controller/sandbox.go`.
-
-Follow these rules:
+Add the provider's plain variables and Secret bindings to
+`sandboxInjection` in `internal/controller/sandbox.go`:
 
 - `SANDBOX_PROVIDER` must equal the canonical provider enum value;
+- variable names must match the pinned upstream control-plane contract;
+- managed-artifact values (base snapshot names, discovered endpoints) come
+  from **status**, never from spec;
 - explicit Worker variables and bindings continue to win;
 - Secret values remain Kubernetes Secret bindings and are never copied into
   the CR status;
-- environment variable names must match the clean pinned upstream contract;
 - add injection and precedence tests to
   `internal/controller/sandbox_test.go`.
-
-Do not add compatibility injection for a provider that clean upstream does
-not support. Use the operator-owned `sandbox-api` path instead.
 
 ### 8. Implement finalization
 
@@ -299,16 +274,14 @@ envtest does not contact a real provider.
 
 ### 9. Add status and conditions
 
-Managed artifact reconciliation should publish stable, provider-neutral
-status rather than raw SDK objects. At minimum record:
+Managed artifact reconciliation publishes stable, provider-neutral status
+(`status.sandboxRuntime`): provider, phase, artifact ID and name, runtime
+digest and source revision, observed generation, last build time. Use
+`metav1.Condition` for:
 
-- provider;
-- artifact ID and name;
-- runtime digest and source revision;
-- phase;
-- observed generation;
-- last successful build time;
-- `RuntimeReady`, `SandboxAPIReady`, and `SandboxEndpointReady` conditions.
+- `RuntimeReady` — the base artifact exists and matches the release digest;
+- `ProviderAppReady` — the provider-side app is deployed and healthy
+  (trivially `True` for providers without a deployed app).
 
 Never place access tokens, signed URLs, sandbox authentication tokens, or
 sandbox environment variables in status, Events, or logs.
@@ -326,8 +299,6 @@ Also update:
 - `config/samples/kustomization.yaml`;
 - Secret creation examples under `hack/` without real values;
 - README provider and deletion documentation;
-- Helm values only if the provider needs operator or `sandbox-api` deployment
-  configuration;
 - RBAC markers if new Kubernetes resource kinds are reconciled.
 
 After marker or deployment changes, regenerate and synchronize distribution
@@ -360,7 +331,8 @@ Unit tests must cover:
 Envtest must prove:
 
 - the Secret watch enqueues the CR;
-- status and conditions advance correctly;
+- build/deploy Jobs are created, adopted, and reflected in status and
+  conditions;
 - deleting the CR invokes the provider cleanup hook;
 - provider failure retains the finalizer;
 - restoring credentials or provider health allows deletion to finish;
@@ -369,24 +341,20 @@ Envtest must prove:
 
 ### Kind test with a mock provider
 
-Add a mock provider API that supports create, list, snapshot, restore, stop,
-delete, and injected failures. The Kind test must run in the isolated Kind
-cluster required by `AGENTS.md`.
+Add a mock provider API that supports artifact build, inspect, delete,
+sandbox list/terminate, and injected failures. The Kind test must run in
+the isolated Kind cluster required by `AGENTS.md`.
 
 ### Guarded live conformance test
 
-A cost-limited live test must:
+A cost-limited live test proves the installer contract (EPIC1 section 9):
 
 1. Apply one CR.
-2. Wait for its runtime artifact and endpoint to become ready.
-3. Create a sandbox.
-4. Verify the runtime bridge.
-5. Execute a command.
-6. Snapshot and restore the sandbox.
-7. Stop the sandbox.
-8. Delete the CR.
-9. Query the provider and confirm that no resources tagged with the CR UID
-   remain.
+2. Wait for `RuntimeReady` and `ProviderAppReady`.
+3. Create a session through the upstream control plane.
+4. Verify a sandbox starts and the runtime bridge connects.
+5. Delete the CR.
+6. Query the provider and confirm no owned resources remain.
 
 Live tests must use a dedicated account/project, strict timeout, sandbox
 auto-expiration, and explicit cost limits.
@@ -397,25 +365,26 @@ For a provider larger than a small SDK addition, use this sequence:
 
 1. Capability matrix, typed client, normalized error model, and unit tests.
 2. CRD configuration, validation, Secret watches, and regenerated manifests.
-3. Base-artifact build and inspection with status conditions.
-4. Provider adapter and `sandbox-api` lifecycle operations.
-5. Ownership metadata and finalizer cleanup.
-6. Mock-provider Kind conformance test.
-7. Sample CR, documentation, Helm synchronization, and guarded live test.
+3. Base-artifact adapter (ensure/inspect/delete) with the runtime-build Job
+   and status conditions.
+4. Ownership metadata and finalizer cleanup.
+5. Mock-provider Kind conformance test.
+6. Sample CR, documentation, Helm synchronization, and guarded live test.
 
-Do not merge a CRD enum value in isolation. Once users can select a provider,
-the corresponding lifecycle and cleanup must already be safe.
+Do not merge a CRD enum value in isolation. Once users can select a
+provider, the corresponding artifact lifecycle and cleanup must already be
+safe.
 
 ## Definition of done
 
 A provider is supported only when all of the following are true:
 
 - One CR and Kubernetes Secret references are sufficient to configure it.
-- No upstream patch, Terraform, CLI, or manual provider deployment is needed.
-- The operator can build or reconcile its base artifact through code.
-- Sandbox create, restore, resume, snapshot, stop, and delete work through the
-  provider adapter.
-- Every provider resource contains CR UID ownership metadata.
+- No upstream patch, Terraform, CLI (outside the D5 modal-deploy Job), or
+  manual provider deployment is needed.
+- The operator builds or adopts its base artifact through code, and the
+  pinned upstream control plane drives its session sandboxes.
+- Every cleanup decision is backed by CR-owned ownership evidence (D8).
 - Reconciliation is idempotent after process restarts and partial failures.
 - Unknown provider state retains the finalizer.
 - `Orphan` is explicit and does not occur accidentally because credentials
@@ -427,18 +396,18 @@ A provider is supported only when all of the following are true:
 ## Final checklist
 
 ```text
-[ ] Official SDK or typed HTTP client; no CLI/Terraform/subprocess
+[ ] Official SDK or typed HTTP client; no CLI/Terraform/subprocess (D5 Job excepted)
 [ ] No upstream changes or private upstream endpoints
 [ ] CRD provider spec, enum, markers, defaults, and status
 [ ] Exactly-one-provider validation
 [ ] Secret watch mapping
-[ ] Managed provider adapter and sandbox-api registration
-[ ] Ownership labels include CR UID
-[ ] Base-artifact ensure/inspect/delete
-[ ] Sandbox create/restore/resume/snapshot/stop
+[ ] Base-artifact ensure/inspect/delete via adapter + runtime-build Job
+[ ] Managed artifact default, explicit reference as external override
+[ ] Ownership evidence from the CR-owned D1 sessions table (D8)
 [ ] Idempotent, ownership-safe finalizer cleanup
 [ ] Unknown health retains finalizer
 [ ] Orphan policy tested
+[ ] RuntimeReady / ProviderAppReady conditions
 [ ] Unit, envtest, Kind mock, and live conformance coverage
 [ ] Sample CR and Secret documentation
 [ ] make manifests generate

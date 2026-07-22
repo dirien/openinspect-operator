@@ -59,10 +59,10 @@ spec:
     provider: modal
     modal:
       workspace: dirien
-      # environment is the Modal environment NAME the app was `modal deploy`ed
-      # into — CR deletion resolves the app by this name to terminate its
-      # sandboxes and stop it. environmentWebSuffix only shapes *.modal.run
-      # URLs; setting a suffix while environment stays "main" is rejected.
+      # environment is the Modal environment NAME the operator deploys the
+      # upstream app into and resolves it from during cleanup. The app's
+      # *.modal.run web suffix is discovered from the deployed endpoints and
+      # recorded in status — it is never configured here.
       environment: main
       tokenIdSecretRef: {name: platform-secrets, key: modalTokenId}
       tokenSecretSecretRef: {name: platform-secrets, key: modalTokenSecret}

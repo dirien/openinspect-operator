@@ -29,6 +29,14 @@ const (
 	ConditionWorkers    = "WorkersReady"
 	ConditionWeb        = "WebReady"
 	ConditionAppSecrets = "AppSecretsReady"
+	// ConditionRuntime is True when the provider base artifact exists and
+	// matches the release's runtime digest (or an external reference is
+	// configured and found).
+	ConditionRuntime = "RuntimeReady"
+	// ConditionProviderApp is True when the provider-side application is
+	// deployed and healthy (the upstream Modal app; trivially True for
+	// providers without a deployed app).
+	ConditionProviderApp = "ProviderAppReady"
 )
 
 // SecretKeyRef selects a key of a Secret in the same namespace.
@@ -186,23 +194,16 @@ type WorkerSpec struct {
 	Cron []string `json:"cron,omitempty"`
 }
 
-// ModalSandboxSpec configures the Modal sandbox provider. The Modal app
-// itself is deployed with `modal deploy` (CLI-only upstream); the operator
-// wires the control plane to it.
+// ModalSandboxSpec configures the Modal sandbox provider. The operator
+// deploys the pinned upstream Modal app itself (modal-deploy Job) and
+// discovers its endpoints; nothing endpoint-shaped is configured here.
 type ModalSandboxSpec struct {
 	Workspace string `json:"workspace"`
-	// Environment is the Modal environment NAME the app is deployed in.
-	// Deletion cleanup resolves the app by this name, so it must match the
-	// environment used with `modal deploy` even when environmentWebSuffix
-	// carries the URL suffix.
+	// Environment is the Modal environment NAME the app is deployed in and
+	// resolved from during cleanup.
 	// +kubebuilder:default="main"
 	// +optional
 	Environment string `json:"environment,omitempty"`
-	// EnvironmentWebSuffix overrides the suffix embedded in the app's
-	// *.modal.run URLs when it differs from the environment name. It never
-	// selects the environment itself — set environment for that.
-	// +optional
-	EnvironmentWebSuffix string `json:"environmentWebSuffix,omitempty"`
 
 	TokenIDSecretRef     SecretKeyRef `json:"tokenIdSecretRef"`
 	TokenSecretSecretRef SecretKeyRef `json:"tokenSecretSecretRef"`
@@ -211,9 +212,11 @@ type ModalSandboxSpec struct {
 
 // DaytonaSandboxSpec configures the Daytona sandbox provider.
 type DaytonaSandboxSpec struct {
-	// BaseSnapshot is the name of a prebuilt Daytona snapshot containing the
-	// sandbox runtime.
-	BaseSnapshot string `json:"baseSnapshot"`
+	// BaseSnapshot names an externally owned, prebuilt Daytona snapshot to
+	// use as-is. Empty means the operator builds and manages the base
+	// snapshot from the release's bundled runtime.
+	// +optional
+	BaseSnapshot string `json:"baseSnapshot,omitempty"`
 	// APIURL of the Daytona API (e.g. https://app.daytona.io/api); the
 	// upstream control plane requires it, and deletion refuses to sweep
 	// against an SDK fallback URL.
@@ -223,6 +226,33 @@ type DaytonaSandboxSpec struct {
 	Target string `json:"target,omitempty"`
 
 	APIKeySecretRef SecretKeyRef `json:"apiKeySecretRef"`
+}
+
+// SandboxRuntimeSpec tunes the operator-managed provider base artifact. The
+// managed build is the default; setting an explicit external reference
+// (daytona.baseSnapshot) is the override that disables it.
+type SandboxRuntimeSpec struct {
+	// Image overrides the container base the managed artifact builds FROM
+	// (e.g. a pinned ghcr.io/dirien/openinspect-sandbox-runtime tag). Empty
+	// means the release's bundled runtime recipe, built from its base image.
+	// +kubebuilder:validation:MaxLength=512
+	// +optional
+	Image string `json:"image,omitempty"`
+	// UpdatePolicy controls when the managed artifact is rebuilt:
+	// OnUpgrade rebuilds whenever the release's runtime digest changes;
+	// Never keeps the current artifact (the reference still flips if one
+	// with the current digest already exists).
+	// +kubebuilder:validation:Enum=OnUpgrade;Never
+	// +kubebuilder:default=OnUpgrade
+	// +optional
+	UpdatePolicy string `json:"updatePolicy,omitempty"`
+	// DeletionPolicy controls whether managed artifacts are deleted with
+	// the CR. Orphan retains them and records their references in status
+	// and events before the finalizer is removed.
+	// +kubebuilder:validation:Enum=Delete;Orphan
+	// +kubebuilder:default=Delete
+	// +optional
+	DeletionPolicy string `json:"deletionPolicy,omitempty"`
 }
 
 // VercelSandboxSpec configures the Vercel sandbox provider. The control
@@ -275,6 +305,10 @@ type SandboxSpec struct {
 	// +kubebuilder:default="control-plane"
 	// +optional
 	ControlPlaneWorker string `json:"controlPlaneWorker,omitempty"`
+
+	// Runtime tunes the operator-managed provider base artifact.
+	// +optional
+	Runtime *SandboxRuntimeSpec `json:"runtime,omitempty"`
 
 	// InactivityTimeoutMS stops idle sandboxes after this many milliseconds.
 	// +optional
@@ -461,6 +495,14 @@ type OpenInspectStatus struct {
 	// skip the round-trip.
 	// +optional
 	AppSecrets *AppSecretsStatus `json:"appSecrets,omitempty"`
+
+	// SandboxRuntime records the managed provider base artifact.
+	// +optional
+	SandboxRuntime *SandboxRuntimeStatus `json:"sandboxRuntime,omitempty"`
+
+	// ModalApp records the operator-deployed upstream Modal app.
+	// +optional
+	ModalApp *ModalAppStatus `json:"modalApp,omitempty"`
 }
 
 // AppSecretsStatus records the last seeded global secrets.
@@ -470,6 +512,83 @@ type AppSecretsStatus struct {
 	// Keys are the store keys this CR manages; used to prune removed ones.
 	// +optional
 	Keys []string `json:"keys,omitempty"`
+}
+
+// Runtime artifact phases surfaced in status.sandboxRuntime.phase.
+const (
+	// RuntimePhasePending: a build is required but its Job has not
+	// completed yet (includes waiting for a free build slot).
+	RuntimePhasePending = "Pending"
+	// RuntimePhaseBuilding: the build Job is running.
+	RuntimePhaseBuilding = "Building"
+	// RuntimePhaseReady: the artifact exists remotely and matches the
+	// release's runtime digest.
+	RuntimePhaseReady = "Ready"
+	// RuntimePhaseFailed: the last build Job failed; the message on the
+	// RuntimeReady condition carries the reason.
+	RuntimePhaseFailed = "Failed"
+	// RuntimePhaseExternal: an explicit artifact reference is configured;
+	// the operator uses it as-is and never builds or deletes it.
+	RuntimePhaseExternal = "External"
+)
+
+// SandboxRuntimeStatus records the managed provider base artifact.
+type SandboxRuntimeStatus struct {
+	Provider string `json:"provider,omitempty"`
+	Phase    string `json:"phase,omitempty"`
+	// SourceRevision is the pinned upstream commit the artifact was built
+	// from; Digest is the canonical runtime bundle digest (sha256:...).
+	// +optional
+	SourceRevision string `json:"sourceRevision,omitempty"`
+	// +optional
+	Digest string `json:"digest,omitempty"`
+	// ArtifactName/ArtifactID identify the remote artifact (e.g. the
+	// Daytona snapshot). The name embeds the digest, so a changed bundle
+	// is a new artifact, never a mutation.
+	// +optional
+	ArtifactName string `json:"artifactName,omitempty"`
+	// +optional
+	ArtifactID string `json:"artifactId,omitempty"`
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+	// +optional
+	LastBuildTime *metav1.Time `json:"lastBuildTime,omitempty"`
+	// PreviousArtifacts are superseded managed artifacts retained for the
+	// rollback grace period before garbage collection.
+	// +kubebuilder:validation:MaxItems=10
+	// +optional
+	PreviousArtifacts []RetiredArtifact `json:"previousArtifacts,omitempty"`
+}
+
+// RetiredArtifact is a superseded managed artifact awaiting GC.
+type RetiredArtifact struct {
+	Name string `json:"name"`
+	// +optional
+	ID        string      `json:"id,omitempty"`
+	RetiredAt metav1.Time `json:"retiredAt"`
+}
+
+// ModalAppStatus records the operator-deployed upstream Modal app.
+type ModalAppStatus struct {
+	// +optional
+	AppID string `json:"appId,omitempty"`
+	// HealthURL is the discovered api-health endpoint of the deployed app.
+	// +optional
+	HealthURL string `json:"healthUrl,omitempty"`
+	// WebSuffix is the environment web suffix discovered from the deployed
+	// endpoints ("" for the default environment); it is what the operator
+	// injects as MODAL_ENVIRONMENT_WEB_SUFFIX.
+	// +optional
+	WebSuffix string `json:"webSuffix,omitempty"`
+	// DeployedSourceRevision is the upstream commit the deploy Job ran.
+	// +optional
+	DeployedSourceRevision string `json:"deployedSourceRevision,omitempty"`
+	// SecretsHash fingerprints the Modal secret inputs last converged
+	// (HMAC-keyed; never reversible to values).
+	// +optional
+	SecretsHash string `json:"secretsHash,omitempty"`
+	// +optional
+	LastDeployTime *metav1.Time `json:"lastDeployTime,omitempty"`
 }
 
 // +kubebuilder:object:root=true
