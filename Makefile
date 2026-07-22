@@ -53,6 +53,10 @@ generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and
 helm-sync: manifests kubebuilder ## Resync dist/chart (CRDs, RBAC) from config/ via the kubebuilder helm plugin.
 	"$(KUBEBUILDER)" edit --plugins=helm/v1-alpha
 
+.PHONY: generate-runtime
+generate-runtime: ## Regenerate Dockerfile.runtime from the canonical runtime manifest (internal/runtime).
+	go run ./cmd/runtimegen -out Dockerfile.runtime
+
 .PHONY: helm-docs
 helm-docs: helm-docs-bin ## Generate dist/chart/README.md from README.md.gotmpl.
 	"$(HELM_DOCS)" -c dist/chart -t README.md.gotmpl -o README.md
@@ -62,7 +66,7 @@ release-snapshot: ## GoReleaser dry run (no publish)
 	goreleaser release --snapshot --clean
 
 .PHONY: check-generated
-check-generated: manifests generate helm-sync helm-docs ## Fail if committed generated files (config/, dist/chart) are stale.
+check-generated: manifests generate helm-sync helm-docs generate-runtime ## Fail if committed generated files (config/, dist/chart, Dockerfile.runtime) are stale.
 	@git diff --exit-code && test -z "$$(git status --porcelain)" || { \
 		git status --porcelain; \
 		echo "::error::Generated files are out of sync. Run 'make manifests generate helm-sync' and commit the result."; \
@@ -143,6 +147,13 @@ CFMOCK_IMG ?= example.com/cfmock:e2e
 .PHONY: docker-build-cfmock
 docker-build-cfmock: ## Build the mock Cloudflare API image for e2e tests.
 	$(CONTAINER_TOOL) build -f Dockerfile.cfmock -t ${CFMOCK_IMG} .
+
+# The sandbox runtime image is linux/amd64 only: upstream pins amd64
+# artifacts (ttyd.x86_64, code-server amd64 .deb, headless Chromium).
+RUNTIME_IMG ?= ghcr.io/dirien/openinspect-sandbox-runtime:dev
+.PHONY: docker-build-runtime
+docker-build-runtime: generate-runtime ## Build the sandbox runtime base image from Dockerfile.runtime.
+	$(CONTAINER_TOOL) build --platform linux/amd64 -f Dockerfile.runtime -t ${RUNTIME_IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

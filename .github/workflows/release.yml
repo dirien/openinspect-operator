@@ -55,6 +55,41 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # The provider-neutral sandbox runtime base image is release-coupled:
+      # it carries the operator version tag, the pinned upstream commit, and
+      # the runtime digest, and is cosign-signed with an SBOM like the
+      # manager image. linux/amd64 only (upstream pins amd64 artifacts).
+      - name: Runtime image metadata
+        id: runtime-meta
+        run: |
+          {
+            echo "digest=$(go run ./cmd/runtimegen -digest)"
+            echo "upstream=$(cat third_party/background-agents/UPSTREAM_COMMIT)"
+            echo "version=${GITHUB_REF_NAME#v}"
+            echo "majorminor=$(echo "${GITHUB_REF_NAME#v}" | cut -d. -f1-2)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push sandbox runtime image
+        id: runtime-push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: Dockerfile.runtime
+          platforms: linux/amd64
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: |
+            ghcr.io/dirien/openinspect-sandbox-runtime:${{ github.ref_name }}
+            ghcr.io/dirien/openinspect-sandbox-runtime:${{ steps.runtime-meta.outputs.majorminor }}
+            ghcr.io/dirien/openinspect-sandbox-runtime:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.runtime-meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Sign sandbox runtime image
+        run: cosign sign --yes "ghcr.io/dirien/openinspect-sandbox-runtime@${{ steps.runtime-push.outputs.digest }}"
+
       - name: Install Helm
         uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
 

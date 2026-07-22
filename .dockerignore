@@ -9,3 +9,8 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Pinned upstream tree: go:embed inputs of the manager binary
+# (internal/runtime, platform bundles) and the COPY source of
+# Dockerfile.runtime.
+!third_party/background-agents/**

@@ -1,0 +1,76 @@
+# Generated from internal/runtime — do not edit by hand.
+# Regenerate with: make generate-runtime
+# Upstream commit: ce2be05f5310a8f7b9c1bc328a176534ced63d75
+FROM python:3.12-slim-bookworm
+LABEL org.opencontainers.image.title="openinspect-sandbox-runtime" \
+      org.opencontainers.image.description="Open-Inspect sandbox runtime base image (provider-neutral)" \
+      org.opencontainers.image.source="https://github.com/dirien/openinspect-operator" \
+      org.opencontainers.image.licenses="Apache-2.0 AND MIT" \
+      dev.dirien.openinspect.upstream-commit="ce2be05f5310a8f7b9c1bc328a176534ced63d75" \
+      dev.dirien.openinspect.runtime-digest="sha256:09f7f4101282d3bca6dc6c2b1d0a950bb2f6bd7fa71f3cc28a507b3f1200711a"
+
+# system-packages
+RUN apt-get update && \
+    apt-get install -y git curl build-essential ca-certificates gnupg openssh-client jq unzip libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 ffmpeg
+
+# github-cli
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main' > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
+
+# node
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
+    apt-get install -y nodejs
+
+# js-toolchain
+RUN npm install -g pnpm@latest && \
+    curl -fsSL https://bun.sh/install | bash
+
+# pip
+RUN python -m pip install --upgrade pip && \
+    python -m pip install 'uv' 'httpx' 'websockets' 'pydantic>=2.0' 'PyJWT[crypto]'
+
+# opencode
+RUN npm install -g opencode-ai@1.17.18 && \
+    npm install -g @opencode-ai/plugin@1.17.18 zod
+
+# opencode-deps
+RUN mkdir -p /app/opencode-deps && \
+    echo '{"name":"opencode-tools","type":"module","dependencies":{"@opencode-ai/plugin":"1.17.18"}}' > /app/opencode-deps/package.json && \
+    cd /app/opencode-deps && npm install --ignore-scripts --no-audit --no-fund && \
+    mkdir -p /root/.config/opencode && \
+    cp -a /app/opencode-deps/. /root/.config/opencode/
+
+# code-server
+RUN curl -fsSL -o /tmp/code-server.deb https://github.com/coder/code-server/releases/download/v4.109.5/code-server_4.109.5_amd64.deb && \
+    dpkg -i /tmp/code-server.deb && \
+    rm /tmp/code-server.deb
+
+# ttyd
+RUN curl -fsSL -o /usr/local/bin/ttyd https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 && \
+    echo "8a217c968aba172e0dbf3f34447218dc015bc4d5e59bf51db2f2cd12b7be4f55  /usr/local/bin/ttyd" | sha256sum -c - && \
+    chmod +x /usr/local/bin/ttyd
+
+# agent-browser
+RUN npm install -g agent-browser@0.21.2 && \
+    agent-browser install
+
+# directories
+RUN mkdir -p /workspace /app /tmp/opencode
+
+# git-credential-helper
+RUN printf '%s\n' '#!/bin/sh' 'exec python3 -m sandbox_runtime.credentials.git_credential_helper "$@"' > /usr/local/bin/oi-git-credentials && \
+    chmod 0755 /usr/local/bin/oi-git-credentials && \
+    git config --system credential.helper /usr/local/bin/oi-git-credentials && \
+    git config --system credential.useHttpPath true
+
+ENV HOME="/root"
+ENV NODE_ENV="development"
+ENV NODE_PATH="/usr/lib/node_modules"
+ENV PATH="/root/.bun/bin:/usr/local/bin:/usr/bin:/bin"
+ENV PYTHONPATH="/app"
+ENV SANDBOX_VERSION="oi-09f7f4101282"
+
+COPY third_party/background-agents/packages/sandbox-runtime/src/sandbox_runtime/ /app/sandbox_runtime/
+WORKDIR /workspace
+ENTRYPOINT ["python", "-m", "sandbox_runtime.entrypoint"]
