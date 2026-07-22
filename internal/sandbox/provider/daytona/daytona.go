@@ -176,12 +176,18 @@ func (p *Provider) EnsureBaseArtifact(ctx context.Context, bundle provider.Runti
 	}
 	defer cleanup()
 
+	// The API rejects the entrypoint FIELD together with a build request
+	// ("Cannot specify an entrypoint when using a build info entry"); for
+	// declarative builds the entrypoint travels as a Dockerfile ENTRYPOINT
+	// instruction inside the image instead (buildImage sets it).
+	params := &daytonatypes.CreateSnapshotParams{Name: name, Image: image}
+	if bundle.BaseImageOverride != "" {
+		// Plain image reference: no build info, the field is accepted.
+		params.Image = bundle.BaseImageOverride
+		params.Entrypoint = bundle.Manifest.Entrypoint
+	}
 	p.cfg.Logf("creating snapshot %s", name)
-	snap, logs, err := client.Snapshot.Create(ctx, &daytonatypes.CreateSnapshotParams{
-		Name:       name,
-		Image:      image,
-		Entrypoint: bundle.Manifest.Entrypoint,
-	})
+	snap, logs, err := client.Snapshot.Create(ctx, params)
 	if err != nil {
 		return provider.Artifact{}, fmt.Errorf("create daytona snapshot %q: %w", name, err)
 	}
@@ -210,7 +216,8 @@ func (p *Provider) EnsureBaseArtifact(ctx context.Context, bundle provider.Runti
 
 // buildImage maps the canonical manifest onto Daytona's declarative image
 // DSL. With a base override, the prebuilt runtime image already carries the
-// toolchain, files, and environment — only the FROM matters.
+// toolchain, files, and environment — only the FROM matters (the caller
+// passes the reference as a plain image, bypassing the builder).
 func (p *Provider) buildImage(bundle provider.RuntimeBundle) (*daytona.DockerImage, func(), error) {
 	m := bundle.Manifest
 	if bundle.BaseImageOverride != "" {
@@ -242,7 +249,9 @@ func (p *Provider) buildImage(bundle provider.RuntimeBundle) (*daytona.DockerIma
 		_ = os.RemoveAll(dir)
 		return nil, nil, fmt.Errorf("materialize runtime tree: %w", err)
 	}
-	img = img.AddLocalDir(dir, m.RuntimeDir).Workdir(m.WorkDir)
+	// Entrypoint as a Dockerfile instruction: the create API refuses the
+	// entrypoint field for build requests.
+	img = img.AddLocalDir(dir, m.RuntimeDir).Workdir(m.WorkDir).Entrypoint(m.Entrypoint)
 	return img, func() { _ = os.RemoveAll(dir) }, nil
 }
 
