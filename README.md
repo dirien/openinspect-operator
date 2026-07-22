@@ -18,7 +18,10 @@ apply`, 13 `null_resource` script shims, `scripts/d1-migrate.sh`, and
 | Service bindings between workers | converge across reconcile passes — a binding to a not-yet-existing worker is retried until the target exists, so circular references (control-plane ↔ bots) need no two-phase apply |
 | Durable Object migrations | `new_sqlite_classes` declared automatically on first upload of a worker |
 | Web UI | runs **in-cluster** as an owned Deployment + Service (env from spec, secrets via `secretKeyRef`) |
-| Sandbox providers | `spec.sandbox` selects **modal / daytona / vercel / opencomputer**; the operator injects that provider's vars and secret bindings into the control-plane worker (explicit worker values win) |
+| Worker bundles & D1 migrations | **embedded in the operator release**, built from the pinned upstream revision — no `worker-bundles` or `d1-migrations` ConfigMaps to create (both remain as development overrides) |
+| Sandbox providers | `spec.sandbox` selects **modal / daytona** (vercel / opencomputer scaffolding exists but is unsupported until the pinned upstream drives them); the operator injects that provider's vars and secret bindings into the control-plane worker (explicit worker values win) |
+| Provider base artifacts | **operator-managed by default**: for Daytona a digest-named base snapshot is built by an owned runtime-build Job from the canonical runtime manifest (`internal/runtime`, pinned toolchain + embedded `sandbox_runtime`); `spec.sandbox.daytona.baseSnapshot` remains the external override. Superseded artifacts are retained for a rollback grace period, then garbage-collected |
+| Modal app deployment | the operator deploys the **unmodified pinned upstream Modal app** with an owned modal-deploy Job (pinned Modal CLI + pinned source baked into `ghcr.io/dirien/openinspect-modal-deploy`), converges the three named Modal secrets it needs via Modal's API, discovers the deployed endpoints, health-checks them, and injects the web suffix into the control plane — `modal deploy` by hand is gone |
 | Platform app secrets | `spec.appSecrets` seeds the platform's global secrets store (what sandboxes receive as env, e.g. `ANTHROPIC_API_KEY`) through the control-plane worker's own API — no web-UI clickops; removed keys are pruned, keys added via the UI are left alone, a wiped store re-seeds itself |
 | Deletion | finalizer removes all Cloudflare resources, terminates the CR's Modal sandboxes and **stops its Modal app** via Modal's Go SDK, and deletes the Daytona sandboxes whose labels match this CR's D1 session index — other installations' sandboxes are never touched; `deletionPolicy: Orphan` keeps everything, including running provider compute |
 
@@ -40,22 +43,31 @@ workers, duplicate worker names) are rejected as a terminal `InvalidSpec`
 condition instead of erroring against the Cloudflare API.
 
 Each CR is one complete installation, isolated per Modal *environment*
-(`spec.sandbox.modal.environment` names it; `environmentWebSuffix` only
-shapes the `*.modal.run` URLs, and a suffix on the defaulted `main`
-environment is rejected because deletion resolves the app by name). Deploying
-the Modal app into an environment is the one workspace-admin install step
-(`MODAL_ENVIRONMENT=<env> modal deploy` — Modal has no API for app
-deployment). Teardown needs no CLI: on CR deletion the operator terminates
-the app's sandboxes and stops the app through Modal's Go SDK, against a
-stock upstream deployment. Daytona cleanup is scoped by ownership evidence:
-the operator reads the session IDs from the CR's own D1 database and deletes
-only sandboxes carrying those session labels, so several installations can
-share one Daytona organization safely.
+(`spec.sandbox.modal.environment` names it). The operator deploys the
+upstream Modal app into that environment itself and discovers the app's
+`*.modal.run` web suffix from the deployed endpoints into
+`status.modalApp` — nothing endpoint-shaped is configured in the spec.
+Teardown needs no CLI: on CR deletion the operator terminates the app's
+sandboxes, deletes the recorded prebuild images (from the CR-owned D1
+`image_builds` evidence), deletes the managed base artifacts, and stops the
+app through Modal's Go SDK. Daytona cleanup is scoped by ownership
+evidence: the operator reads the session IDs from the CR's own D1 database
+and deletes only sandboxes carrying those session labels, so several
+installations can share one Daytona organization safely.
+`spec.sandbox.runtime.deletionPolicy: Orphan` retains managed artifacts and
+records their references before the finalizer is removed.
+
+The operator pins one exact upstream revision per release
+(`third_party/background-agents/UPSTREAM_COMMIT`, synced and CI-verified by
+`hack/sync-upstream.sh`); the runtime toolchain pins are parity-tested
+against that revision, and worker bundles are rebuilt and byte-compared in
+CI. The release also ships `ghcr.io/dirien/openinspect-sandbox-runtime`
+(the provider-neutral runtime base image, usable as
+`spec.sandbox.runtime.image`).
 
 Out of scope (not automatable via APIs): GitHub/Slack/Linear/Google app
-registrations, Modal app *deployment* (see above), and
-Modal/Daytona/OpenComputer sandbox image builds (CLI- and script-driven
-upstream).
+registrations and the per-deployment web image builds (`NEXT_PUBLIC_*`
+values are baked in at build time by upstream's design).
 
 ## Custom resource
 
@@ -73,13 +85,11 @@ spec:
     accountId: "..."
     apiTokenSecretRef: {name: cloudflare-credentials, key: apiToken}
     # apiBaseURL: optional override (regional gateway or test mock)
-  d1:
-    migrationsConfigMapRef: d1-migrations    # keys: 0001_xxx.sql, 0002_yyy.sql, ...
+  d1: {}                                     # embedded migrations apply by default
   kvNamespaces: [session-index]
   r2Buckets: [media]
   workers:
-    - name: control-plane
-      script: {configMapRef: {name: worker-bundles, key: control-plane.js}}  # or url:
+    - name: control-plane                    # embedded release bundle; script: is a dev override
       bindings:
         d1: [{binding: DB}]
         kv: [{binding: REPOS_CACHE, namespace: session-index}]
@@ -160,6 +170,10 @@ make deploy IMG=<registry>/openinspect-operator:tag
 make test        # unit + envtest; the reconciler runs against an in-process mock Cloudflare API
 make test-e2e    # kind e2e: deploys the operator + a mock Cloudflare API pod,
                  # applies a full CR, verifies provisioning and cleanup
+
+# guarded live provider conformance (real accounts, cost-limited, opt-in):
+OI_LIVE_DAYTONA=1 DAYTONA_API_KEY=... go test -tags=live ./test/live/ -run Daytona -v -timeout 45m
+OI_LIVE_MODAL=1 MODAL_TOKEN_ID=... MODAL_TOKEN_SECRET=... MODAL_WORKSPACE=...   go test -tags=live ./test/live/ -run Modal -v
 ```
 
 The mock Cloudflare API (`internal/cfmock`, image built from
