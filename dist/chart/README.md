@@ -35,6 +35,8 @@ placeholder.
 | controllerManager.container.runtimeBuilderImage | string | `""` | Image run by runtime-build Jobs (needs /runtime-builder from this repository). Empty follows the manager image, which is almost always right since the operator image ships both binaries. |
 | controllerManager.container.securityContext.allowPrivilegeEscalation | bool | `false` |  |
 | controllerManager.container.securityContext.capabilities.drop[0] | string | `"ALL"` |  |
+| controllerManager.container.webImageDaytona | string | `""` | Release web image for provider daytona (spec.web.image empty). Empty selects the release-matched ghcr.io/dirien/openinspect-web image. |
+| controllerManager.container.webImageModal | string | `""` | Release web image for provider modal (spec.web.image empty). Empty selects the release-matched ghcr.io/dirien/openinspect-web image. |
 | controllerManager.replicas | int | `1` |  |
 | controllerManager.securityContext.runAsNonRoot | bool | `true` |  |
 | controllerManager.securityContext.seccompProfile.type | string | `"RuntimeDefault"` |  |
