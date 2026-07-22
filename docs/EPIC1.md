@@ -1,17 +1,55 @@
-# EPIC 1: Operator-Managed Sandbox Runtime and Lifecycle
+# EPIC 1: Operator-Managed Provider Artifacts and Installation Lifecycle
 
 ## Goal
 
-Applying one `OpenInspect` custom resource must cause the operator to build or
-reconcile the runtime artifacts and operate every sandbox through provider
-APIs. The completed setup must not require Terraform, provider CLIs, manually
-supplied snapshot names, or a manually deployed Modal application.
+Applying one `OpenInspect` custom resource must install everything an
+unmodified upstream [ColeMurray/background-agents](https://github.com/ColeMurray/background-agents)
+("Open-Inspect") deployment needs: Cloudflare resources, worker bundles, D1
+migrations, the web application, provider base artifacts, and the upstream
+Modal application. The completed setup must not require Terraform, manually
+run provider CLIs, manually supplied snapshot names, or manually created
+ConfigMaps.
 
-Cloudflare Workers initiate sessions while the operator runs inside
-Kubernetes. To let the operator own each sandbox without exposing the manager
-and its Kubernetes privileges, the operator will reconcile a separate,
-externally reachable `sandbox-api` workload for each `OpenInspect` resource.
-This workload remains part of this repository and the operator release.
+The operator is an **installer and lifecycle manager for unmodified
+upstream**. It is not a runtime component: upstream's control plane drives
+every running sandbox, and the operator never sits in the session path.
+
+## Architecture decisions
+
+These were settled during planning review and constrain everything below:
+
+- **D1 — Installer, not middleman.** No operator-owned sandbox API. The
+  previously planned per-CR `sandbox-api` Deployment, its HMAC endpoint
+  design, and the Ingress/Gateway endpoint modes are removed. Upstream's
+  control plane makes all provider calls at runtime, as designed upstream.
+- **D2 — Upstream is never modified.** No forks, no patches, no source
+  changes — including the control-plane worker and the web application. The
+  web image keeps its build-time provider configuration; no
+  `/api/platform-info` change.
+- **D3 — Supported providers are derived from the pinned upstream
+  revision**, not listed in this document. Today that is Modal and Daytona
+  (see [ADDING_SANDBOX_PROVIDER.md](./ADDING_SANDBOX_PROVIDER.md)). Vercel
+  and OpenComputer join when the pinned upstream revision actually drives
+  them; their CRD scaffolding must not be advertised as supported until then.
+- **D4 — The operator owns base artifacts and cleanup only.** It builds,
+  inspects, and deletes provider base artifacts, and terminates owned
+  sandboxes during finalization. It never creates, snapshots, resumes, or
+  stops sandboxes for running sessions.
+- **D5 — The upstream Modal app is deployed by an operator-owned Job**
+  running the pinned Modal CLI against the pinned upstream source. Modal
+  Functions cannot be deployed through the Go SDK (deployment requires
+  Modal's Python toolchain); this Job is the single scoped exception to the
+  no-CLI rule in ADDING_SANDBOX_PROVIDER.md, which must be amended
+  accordingly. Everything else remains Go SDK or typed HTTP only.
+- **D6 — No blue/green.** Artifacts are digest-named; the operator builds
+  the new artifact, flips the reference, retains the previous artifact for a
+  grace period, then garbage-collects it. No smoke-test sandboxes.
+- **D7 — No migration machinery.** There are zero existing installations.
+  No `managementPolicy: External` compatibility mode, no deprecation cycle.
+- **D8 — D1 session-intersection is the permanent ownership mechanism.**
+  Unmodified upstream cannot label sandboxes with the CR UID, so ownership
+  is always established by intersecting provider sandbox labels with the
+  CR-owned D1 `sessions` table. It is not a migration fallback.
 
 ## Target architecture
 
@@ -19,42 +57,23 @@ This workload remains part of this repository and the operator release.
 OpenInspect CR
     |
     +-- OpenInspect controller
-    |    +-- Cloudflare resources
-    |    +-- provider base artifact
-    |    +-- web Deployment
-    |    +-- per-CR sandbox-api Deployment
-    |    +-- external sandbox endpoint
-    |
-Cloudflare control-plane
-    |
-    | authenticated HTTPS
-    v
-sandbox-api
-    +-- Modal Go SDK
-    +-- Daytona Go SDK
-    +-- Vercel REST API
-    +-- OpenComputer HTTP API
-         |
-         v
-   provider sandboxes
+         +-- Cloudflare resources (D1, KV, R2, Workers)
+         +-- embedded worker bundles + D1 migrations
+         +-- web Deployment + Service
+         +-- runtime-build Job  -> provider base artifact (Go SDK / HTTP)
+         +-- modal-deploy Job   -> upstream Modal app (pinned Modal CLI)
+
+Runtime (operator not involved):
+Cloudflare control-plane worker
+    +-- Modal path:   HTTPS -> upstream Modal app -> Modal sandboxes
+    +-- Daytona path: HTTPS -> Daytona REST API   -> Daytona sandboxes
 ```
-
-Each `OpenInspect` instance receives its own `sandbox-api` Deployment. It is
-given only that tenant's provider credentials and has no Kubernetes RBAC.
-
-Modal's Go SDK can create sandboxes, build images, and take filesystem
-snapshots directly. It cannot deploy Modal Functions, but the new architecture
-does not require Modal Functions because `sandbox-api` replaces the upstream
-Modal HTTP application.
 
 References:
 
 - [Modal JavaScript and Go SDKs](https://modal.com/docs/guide/sdk-javascript-go)
 - [Modal sandbox snapshots](https://modal.com/docs/guide/sandbox-snapshots)
 - [Daytona Go SDK](https://www.daytona.io/docs/en/go-sdk/daytona/)
-- [Vercel REST API](https://vercel.com/docs/rest-api)
-- [Vercel custom sandbox images](https://vercel.com/changelog/vercel-sandbox-now-support-custom-images)
-- [OpenComputer templates](https://docs.opencomputer.dev/sandboxes/templates)
 
 ## Scope and ownership
 
@@ -63,21 +82,16 @@ The operator owns:
 - the pinned upstream Open-Inspect source revision;
 - the platform worker bundles and D1 migrations;
 - the web application image;
-- the provider-neutral sandbox runtime;
-- provider base images, snapshots, or templates;
-- the per-tenant sandbox API;
-- creation, restoration, snapshotting, resumption, and termination of session
-  sandboxes;
-- prebuilt repository and environment images;
+- the provider-neutral runtime manifest and its base artifacts (images,
+  snapshots);
+- deployment of the upstream Modal application;
 - provider artifact garbage collection;
 - finalization of all externally owned resources.
 
 The only external prerequisites are:
 
 - provider accounts and API credentials;
-- OAuth and external application registrations that have no management API;
-- an externally reachable HTTPS route for `sandbox-api`, implemented by the
-  user's chosen Ingress, Gateway, tunnel, or proxy system.
+- OAuth and external application registrations that have no management API.
 
 ## Implementation plan
 
@@ -93,8 +107,13 @@ third_party/background-agents/
   packages/web/
   packages/control-plane/
   packages/shared/
+  <modal app source directory>
   terraform/d1/migrations/
 ```
+
+The synced file list must be audited against what each supported provider's
+installation actually consumes — in particular the Modal application source,
+which the deploy Job in section 6 requires.
 
 Add:
 
@@ -105,7 +124,7 @@ Add:
 - Renovate or a scheduled pull request for upstream updates.
 
 The running operator must never fetch upstream `main`. Every operator release
-must pin one exact upstream commit.
+pins one exact upstream commit.
 
 ### 2. Create a canonical runtime bundle
 
@@ -129,63 +148,43 @@ It must contain:
 - embedded `sandbox-runtime` files;
 - a deterministic SHA-256 digest.
 
-Every provider adapter must consume the same manifest. A tool or runtime
-change must therefore produce one new digest for all providers.
+Every provider adapter consumes the same manifest, so a tool or runtime
+change produces one new digest for all providers.
 
 ### 3. Publish release-coupled images
 
-Build and publish these artifacts from this repository:
-
 ```text
 ghcr.io/dirien/openinspect-operator:<version>
-ghcr.io/dirien/openinspect-sandbox-api:<version>
 ghcr.io/dirien/openinspect-sandbox-runtime:<version>
-ghcr.io/dirien/openinspect-web:<version>
 ```
 
-All images must carry:
+All images carry the operator version, the upstream commit, the runtime
+digest, OCI source and revision labels, an SBOM, and a cosign signature.
 
-- the operator version;
-- the upstream commit;
-- the runtime digest;
-- OCI source and revision labels;
-- an SBOM;
-- a cosign signature.
+The sandbox runtime image is the common base for provider artifacts. Web
+images retain their current per-provider, per-deployment builds because
+`NEXT_PUBLIC_*` values are baked in at build time (D2 forbids the upstream
+change that would lift this).
 
-The sandbox runtime image is the common base for Modal and Daytona. Vercel can
-consume a custom OCI sandbox image from Vercel Container Registry. Because
-this feature is currently public beta, its provider adapter must retain a
-snapshot-based fallback.
-
-OpenComputer must receive a provider-specific declarative image JSON generated
-from the same canonical runtime manifest.
-
-### 4. Change the CRD from artifact references to managed artifacts
-
-Add common runtime configuration:
+### 4. CRD: managed artifacts by default, references as overrides
 
 ```yaml
 spec:
   sandbox:
     provider: modal
-    managementPolicy: Managed
     runtime:
       image: ""               # Empty means the release's bundled runtime.
       updatePolicy: OnUpgrade
       deletionPolicy: Delete
 ```
 
-Provider configuration must contain credentials and provider options rather
-than mandatory prebuilt artifact names.
-
-API changes:
-
-- make Daytona `baseSnapshot` an optional external override;
-- make OpenComputer `template` an optional external override;
-- retain Vercel snapshot/image references as optional overrides;
-- remove Modal `apiSecretSecretRef`, environment web suffix, and deployed-app
-  endpoint fields from the managed path;
-- temporarily retain `managementPolicy: External` for migration compatibility.
+- An empty artifact reference means the operator builds and manages the
+  artifact. A set reference (Daytona `baseSnapshot`, Vercel snapshot/image,
+  OpenComputer `template`) means it is externally owned and used as-is.
+- Modal deployed-app endpoint fields move from spec to status: the operator
+  deploys the app and discovers the endpoint itself.
+- No `managementPolicy` field (D7): the presence of an explicit reference is
+  the override.
 
 Add runtime status:
 
@@ -204,15 +203,14 @@ status:
 
 Use `metav1.Condition` for:
 
-- `RuntimeReady`;
-- `SandboxAPIReady`;
-- `SandboxEndpointReady`.
+- `RuntimeReady` — the base artifact exists and matches the release digest;
+- `ProviderAppReady` — the upstream Modal app is deployed and healthy
+  (trivially `True` for providers without a deployed app).
 
-After changing API types or markers, run `make manifests` and `make generate`.
+After changing API types or markers, run `make manifests` and
+`make generate` (and `make helm-sync`).
 
-### 5. Implement provider adapters
-
-Create a shared interface:
+### 5. Implement provider artifact adapters
 
 ```go
 type Provider interface {
@@ -220,301 +218,57 @@ type Provider interface {
 	InspectBaseArtifact(context.Context, Artifact) (ArtifactState, error)
 	DeleteBaseArtifact(context.Context, Artifact) error
 
-	CreateSandbox(context.Context, CreateRequest) (Sandbox, error)
-	RestoreSandbox(context.Context, RestoreRequest) (Sandbox, error)
-	SnapshotSandbox(context.Context, SnapshotRequest) (Snapshot, error)
-	ResumeSandbox(context.Context, ResumeRequest) (Sandbox, error)
-	StopSandbox(context.Context, StopRequest) error
-	DeleteSnapshot(context.Context, string) error
+	// Finalization only (D4). Ownership per D8.
 	ListOwnedSandboxes(context.Context, OwnerMetadata) ([]Sandbox, error)
+	TerminateSandbox(context.Context, string) error
 }
 ```
-
-Implement it under:
 
 ```text
 internal/sandbox/provider/
   provider.go
   modal/
   daytona/
-  vercel/
-  opencomputer/
 ```
 
-Provider implementations:
+- **Modal:** official `modal-client/go` SDK. Create or find the app record,
+  build or pull the base image, inspect and delete artifacts, list and
+  terminate sandboxes during finalization. Never deploy Modal Functions from
+  Go — that is the deploy Job's task (section 6).
+- **Daytona:** official Go SDK declarative image and snapshot APIs, which
+  support build contexts and streamed snapshot builds directly.
 
-- **Modal:** Use the official `modal-client/go` SDK. Create or find the app
-  record, build or pull the base image, create sandboxes, execute the runtime
-  entrypoint, snapshot filesystems, restore, and terminate. Do not deploy
-  Modal Functions and do not invoke `modal deploy`.
-- **Daytona:** Use the official Go SDK's declarative image and snapshot APIs.
-  It supports build contexts and streamed snapshot builds directly.
-- **Vercel:** Implement a typed Go REST client for sandbox creation, commands,
-  files, snapshots, stop, and delete. Prefer the release runtime OCI image and
-  retain the snapshot builder as a fallback while custom images are beta.
-- **OpenComputer:** Implement a typed Go HTTP client for declarative image
-  manifests, snapshots, and sandbox lifecycle. Keep this adapter isolated
-  because the template API is alpha.
+There is no sandbox runtime lifecycle in this interface. Session sandboxes
+are created, snapshotted, resumed, and stopped by upstream's control plane.
 
-### 6. Make base-artifact builds asynchronous
+### 6. Asynchronous builds and the Modal deploy Job
 
-Remote builds must not block reconciliation for several minutes.
-
-Add:
+Remote builds must not block reconciliation.
 
 ```text
 cmd/runtime-builder/main.go
 internal/controller/runtimebuild.go
 ```
 
-The controller creates an owned Kubernetes Job named from the runtime digest.
-The Job:
+The controller creates owned Kubernetes Jobs named from the runtime digest:
 
-- contains no provider CLI binaries;
-- invokes only Go SDK or HTTP code;
-- mounts only the selected provider Secret;
-- builds a deterministic artifact name;
-- exits successfully only after the remote artifact is usable.
+- **runtime-build Job** (all providers): Go SDK / HTTP only, mounts only the
+  selected provider Secret, builds a deterministically named artifact, exits
+  successfully only after the remote artifact is usable.
+- **modal-deploy Job** (Modal only, D5): a builder image containing the
+  pinned Modal CLI deploys the unmodified pinned upstream Modal app into the
+  tenant's Modal environment. Idempotent; re-runs on upstream bump or
+  runtime digest change. On success the controller health-checks the
+  deployed endpoints, records the app URL in status, and injects it into the
+  control-plane worker configuration.
 
-The controller then inspects the artifact through the provider API and updates
-status.
+Rollout (D6): build the new digest-named artifact, flip the reference the
+control plane consumes, retain the previous artifact for a rollback grace
+period, then delete it.
 
-Runtime rollout must be blue/green:
+### 7. Package worker bundles and migrations
 
-1. Build the new artifact.
-2. Start a smoke-test sandbox.
-3. Verify runtime health and bridge startup.
-4. Switch `sandbox-api` to the new artifact.
-5. Retain the previous artifact for a rollback window.
-6. Delete the previous artifact after the grace period.
-
-### 7. Add the operator-owned sandbox API
-
-Add:
-
-```text
-cmd/sandbox-api/main.go
-internal/sandboxapi/
-  server.go
-  auth.go
-  request.go
-  response.go
-  metrics.go
-```
-
-Expose a versioned API:
-
-```text
-GET    /v1/health
-POST   /v1/sandboxes
-POST   /v1/sandboxes/restore
-POST   /v1/sandboxes/{id}/snapshot
-POST   /v1/sandboxes/{id}/resume
-POST   /v1/sandboxes/{id}/stop
-POST   /v1/images/build
-DELETE /v1/images/{id}
-```
-
-Initially reuse the upstream Modal endpoint request and response shapes. They
-already represent create, restore, snapshot, and image-build operations, which
-minimizes the control-plane change.
-
-Every request must include:
-
-- deployment UID;
-- session and sandbox IDs;
-- timestamp and nonce;
-- HMAC signature;
-- correlation and trace IDs.
-
-Every remote provider resource must carry ownership metadata:
-
-```text
-openinspect.uid
-openinspect.namespace
-openinspect.name
-openinspect.session_id
-openinspect.sandbox_id
-openinspect.runtime_digest
-```
-
-### 8. Reconcile one sandbox-api Deployment per CR
-
-The operator creates:
-
-- a Deployment;
-- a Service;
-- provider Secret mounts;
-- a NetworkPolicy;
-- a PodDisruptionBudget when replicas exceed one;
-- readiness and liveness probes;
-- immutable runtime-artifact configuration.
-
-The pod must:
-
-- run non-root;
-- use a read-only root filesystem;
-- have no Kubernetes API token;
-- receive only the selected provider credentials;
-- never log request environment variables or tokens.
-
-Provider credentials must be removed from the Cloudflare control-plane worker.
-The worker receives only the sandbox API URL and HMAC secret.
-
-### 9. Provide pluggable external connectivity
-
-The Cloudflare control-plane must be able to reach `sandbox-api`, but the
-operator must not require a particular ingress vendor. It must always create a
-stable namespaced `ClusterIP` Service:
-
-```text
-Service: <openinspect-name>-sandbox-api
-Port:    8080
-Paths:   /v1/*
-```
-
-Users can expose this Service through nginx, ngrok, Traefik, HAProxy, an
-existing cloud load balancer, Gateway API, or another system. The application
-contract is only an externally reachable HTTPS URL; routing implementation is
-not part of the sandbox provider contract.
-
-Add an endpoint configuration with three modes:
-
-```yaml
-spec:
-  sandbox:
-    endpoint:
-      mode: Ingress
-      publicURL: https://sandboxes.example.com
-      ingress:
-        className: nginx # nginx, ngrok, traefik, or another IngressClass
-        annotations: {}
-        host: sandboxes.example.com
-        tlsSecretName: sandboxes-example-com-tls
-```
-
-In `Ingress` mode, the operator creates a standard
-`networking.k8s.io/v1/Ingress`. It must not depend on vendor CRDs. The selected
-Ingress controller interprets `className` and optional annotations. The
-operator generates the backend Service reference and restricts the route to
-`/v1`.
-
-The generated resource is equivalent to:
-
-```yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: example-sandbox-api
-  namespace: example
-spec:
-  ingressClassName: nginx # May also be ngrok, traefik, etc.
-  tls:
-    - hosts: [sandboxes.example.com]
-      secretName: sandboxes-example-com-tls
-  rules:
-    - host: sandboxes.example.com
-      http:
-        paths:
-          - path: /v1
-            pathType: Prefix
-            backend:
-              service:
-                name: example-sandbox-api
-                port:
-                  number: 8080
-```
-
-Support an externally managed route without creating an Ingress:
-
-```yaml
-spec:
-  sandbox:
-    endpoint:
-      mode: External
-      publicURL: https://sandbox-api.example.com
-```
-
-In `External` mode, the operator creates only the Service. A user, platform
-operator, Helm release, ngrok integration, or other automation owns the route.
-The operator validates the URL, waits for its health endpoint, and injects it
-into the Cloudflare control-plane worker.
-
-Gateway API can be supported as an additional convenience mode without making
-it mandatory:
-
-```yaml
-spec:
-  sandbox:
-    endpoint:
-      mode: GatewayAPI
-      publicURL: https://sandboxes.example.com
-      gatewayAPI:
-        parentRef:
-          name: public
-          namespace: gateway-system
-        hostname: sandboxes.example.com
-```
-
-In `GatewayAPI` mode, the operator creates an `HTTPRoute` targeting the same
-ClusterIP Service. This mode must be optional so clusters without Gateway API
-can use standard Ingress or an externally managed route.
-
-Endpoint reconciliation rules:
-
-1. Reconcile the `sandbox-api` Deployment and ClusterIP Service first.
-2. Create an Ingress or HTTPRoute only when its corresponding mode is selected.
-3. Resolve the effective HTTPS URL from `publicURL` or the route status.
-4. Check `GET <publicURL>/v1/health` before publishing the URL to the worker.
-5. Set `SandboxEndpointReady=True` only after the external health check passes.
-6. Requeue without rolling out a broken URL when DNS, TLS, or routing is not
-   ready.
-7. On mode changes, make the new route healthy before deleting the old route.
-
-Security requirements apply regardless of ingress implementation:
-
-- production endpoints require HTTPS;
-- HMAC authentication and nonce replay protection remain mandatory even when
-  the ingress adds its own authentication;
-- only `/v1/*` is routed to `sandbox-api`;
-- request body limits, timeouts, and rate limits have safe defaults that users
-  can override with ingress annotations where required;
-- the manager's metrics, health, webhook, and Kubernetes credentials are never
-  exposed;
-- `sandbox-api` continues to run without a Kubernetes service-account token.
-
-Add ready-to-copy examples under `config/samples/exposure/` for generic
-Ingress, nginx, ngrok, Traefik, Gateway API, and externally managed routes.
-
-### 10. Change the upstream control-plane integration
-
-Build the control-plane bundle from the pinned upstream source with one
-architectural change: replace provider-specific clients with a generic
-`SandboxAPIClient`.
-
-The operator injects:
-
-```text
-SANDBOX_PROVIDER
-SANDBOX_API_URL
-SANDBOX_API_SECRET
-```
-
-Remove these provider credentials from the Cloudflare worker:
-
-```text
-MODAL_TOKEN_*
-DAYTONA_API_KEY
-VERCEL_TOKEN
-OPENCOMPUTER_API_KEY
-```
-
-The control plane retains session decisions and D1 state. The Kubernetes-side
-sandbox API owns every provider call.
-
-### 11. Package worker bundles and migrations
-
-Users must not have to create `worker-bundles` or `d1-migrations` ConfigMaps.
+Users must not create `worker-bundles` or `d1-migrations` ConfigMaps.
 
 Build bundles during the operator release and embed them:
 
@@ -528,120 +282,89 @@ internal/platformbundle/
   metadata.json
 ```
 
-Use `go:embed` and apply built-in bundles by default. Retain ConfigMap and URL
-overrides only for development.
+Use `go:embed` and apply built-in bundles by default. Retain ConfigMap and
+URL overrides only for development. The platform bundle version, web image,
+runtime image, and operator version advance atomically.
 
-The platform bundle version, web image, runtime image, sandbox API image, and
-operator version must advance atomically.
+### 8. Cleanup and ownership
 
-### 12. Make the web image provider-neutral
-
-Add a production `Dockerfile.web` for the upstream standalone Next.js output.
-
-Remove separate `:modal` and `:daytona` images. The web app must obtain
-provider capabilities at runtime from `/api/platform-info`, rather than from a
-build-time `NEXT_PUBLIC_SANDBOX_PROVIDER` value.
-
-The operator automatically injects:
-
-```text
-SANDBOX_PROVIDER
-CONTROL_PLANE_URL
-NEXTAUTH_URL
-```
-
-This produces one immutable web image for all providers.
-
-### 13. Implement cleanup and ownership
-
-#### Current upstream-compatible finalization baseline
-
-The existing operator must be safe before the new `sandbox-api` architecture
-lands. Its cleanup implementation must work with an unmodified checkout of
-`ColeMurray/background-agents`:
+The upstream-compatible cleanup baseline is the permanent design (D8):
 
 - never add or depend on `api-stop-app`, `api-terminate-sandboxes`, or any
   other private Modal web function;
 - use Modal's Go SDK to find the `open-inspect` app in the CR's environment,
-  list and terminate both v1 and v2 sandboxes, and stop the app with Modal's
-  authenticated provider API;
+  list and terminate both v1 and v2 sandboxes, and stop the app through
+  Modal's authenticated provider API;
 - use the Daytona Go SDK to list sandboxes carrying
   `openinspect_framework=open-inspect` and delete them through
   `DELETE /sandbox/{id}`;
-- never interpret `openinspect_framework` alone as ownership because every
+- never interpret `openinspect_framework` alone as ownership — every
   Open-Inspect deployment uses that value;
-- read session IDs from the CR-owned D1 `sessions` table and delete a Daytona
+- read session IDs from the CR-owned D1 `sessions` table and delete a
   sandbox only when its `openinspect_session_id` label occurs in that set;
 - query D1 and finish provider cleanup before deleting D1 itself;
 - keep the finalizer on missing credentials, provider errors, D1 ownership
-  query failures, timeouts, DNS failures, or unknown Modal health.
+  query failures, timeouts, DNS failures, or unknown provider health.
 
-This baseline is an operator-only change. It does not modify, fork, or patch
-upstream source. After the managed `sandbox-api` path is complete, CR UID
-labels become the primary ownership key and the D1 intersection remains a
-migration fallback for sandboxes created by older releases.
+Finalization order:
 
-Finalization must:
-
-1. Stop or terminate every provider sandbox tagged with the CR UID.
+1. Terminate every owned provider sandbox (D8 ownership evidence).
 2. Delete provider repository and environment images.
 3. Delete the managed base artifact.
-4. Remove operator-created endpoint resources.
+4. Stop the deployed upstream Modal app.
 5. Remove Cloudflare resources.
 6. Remove the finalizer only after confirmed cleanup.
 
-Unknown provider health must retain the finalizer and retry. A network failure
-must never be interpreted as successful deletion.
-
-`deletionPolicy: Orphan` must retain remote artifacts and write their complete
+A network failure must never be interpreted as successful deletion.
+`deletionPolicy: Orphan` retains remote artifacts and writes their complete
 references into status and events before finalizer removal.
 
-### 14. Add testing gates
+### 9. Testing gates
 
-Add four test levels:
+- **Unit:** provider clients behind interfaces, retry and error
+  classification, manifest and digest stability, ownership logic.
+- **Envtest:** build and deploy Jobs, status transitions, finalizers, Secret
+  watches.
+- **Kind:** mock provider API implementing artifact builds and cleanup.
+- **Live nightly:** one guarded, cost-limited test per supported provider
+  (currently Modal and Daytona).
 
-- **Unit:** Provider clients behind interfaces, retry and error
-  classification, manifests, ownership, and digest stability.
-- **Envtest:** Runtime-build Job, Deployment, status transitions, finalizers,
-  and Secret watches.
-- **Kind:** Mock provider API implementing builds, sandboxes, snapshots,
-  restore, and cleanup.
-- **Live nightly:** One guarded, cost-limited provider test for each provider.
-
-Every live conformance test must prove:
+Each live conformance test proves the installer contract:
 
 1. Apply one CR.
-2. Wait for the base runtime to become ready.
-3. Create a sandbox.
-4. Verify the runtime bridge connects.
-5. Execute a command.
-6. Snapshot the sandbox.
-7. Restore it.
-8. Stop it.
-9. Delete the CR.
-10. Confirm no owned provider resources remain.
+2. Wait for `RuntimeReady` and `ProviderAppReady`.
+3. Create a session through the upstream control plane.
+4. Verify a sandbox starts and the runtime bridge connects.
+5. Delete the CR.
+6. Confirm no owned provider resources remain.
 
-## Recommended pull request sequence
+## Pull request sequence
 
-1. Pin and synchronize upstream; create the canonical runtime manifest.
-2. Build the web, runtime, and sandbox API release images.
-3. Add CRD managed-runtime fields and status.
-4. Add the provider interface and Daytona implementation.
-5. Add the Vercel implementation.
-6. Add the OpenComputer implementation.
-7. Add the direct Modal Go implementation and remove Modal app deployment.
-8. Add the `sandbox-api` Deployment, stable Service, generic Ingress, external
-   URL, and optional Gateway API support.
-9. Switch the control-plane bundle to `SandboxAPIClient`.
-10. Embed worker bundles and migrations.
-11. Add blue/green artifact upgrades and cleanup.
-12. Add live provider conformance tests.
-13. Remove external-artifact compatibility fields after one deprecation cycle.
+1. Pin and synchronize upstream (including the Modal app source); create the
+   canonical runtime manifest.
+2. Build the runtime release image.
+3. Add CRD managed-runtime fields and status; amend
+   ADDING_SANDBOX_PROVIDER.md with the D5 exception.
+4. Add the provider artifact interface and the Daytona implementation.
+5. Add the Modal implementation and the modal-deploy Job; remove manual
+   Modal app deployment from the documented install path.
+6. Embed worker bundles and migrations.
+7. Add artifact garbage collection and finalization hardening.
+8. Add live provider conformance tests.
+
+## Future work (out of scope)
+
+- **Vercel and OpenComputer adapters** — blocked on the pinned upstream
+  revision driving these providers (D3). When unblocked, note that Vercel
+  custom images are public beta and the OpenComputer template API is alpha;
+  entering this work accepts that API risk.
+- Lifting the per-provider web image builds, which requires an upstream
+  change (D2).
 
 ## Definition of done
 
-The epic is complete when installation requires only provider credentials and
-one custom resource:
+The epic is complete when installation requires only provider credentials
+and one custom resource:
 
 ```sh
 kubectl create secret ...provider credentials...
@@ -651,13 +374,10 @@ kubectl apply -f openinspect.yaml
 No human must:
 
 - run Terraform;
-- run `modal deploy`;
-- run Daytona, Vercel, or OpenComputer CLIs;
+- run `modal deploy` or any provider CLI;
 - build a provider snapshot manually;
 - create worker or migration ConfigMaps;
-- choose a provider-specific web image;
-- copy an artifact ID into the CR.
+- copy an artifact ID or app endpoint into the CR.
 
-The only remaining prerequisites are provider accounts and credentials, OAuth
-application registrations, and an externally reachable HTTPS route implemented
-with the user's preferred ingress, gateway, tunnel, or proxy system.
+The only remaining prerequisites are provider accounts and credentials and
+OAuth application registrations.
