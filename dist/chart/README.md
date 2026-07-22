@@ -16,8 +16,8 @@ placeholder.
 | controllerManager.container.args[0] | string | `"--leader-elect"` |  |
 | controllerManager.container.args[1] | string | `"--metrics-bind-address=:8443"` |  |
 | controllerManager.container.args[2] | string | `"--health-probe-bind-address=:8081"` |  |
-| controllerManager.container.image.repository | string | `"controller"` |  |
-| controllerManager.container.image.tag | string | `"latest"` |  |
+| controllerManager.container.image.repository | string | `"ghcr.io/dirien/openinspect-operator"` | Operator image; the release publishes ghcr.io/dirien/openinspect-operator. |
+| controllerManager.container.image.tag | string | `""` | Image tag. Empty follows the chart appVersion as v<appVersion>, which matches the release tagging — a released chart installs its matching images with no overrides. |
 | controllerManager.container.imagePullPolicy | string | `"IfNotPresent"` |  |
 | controllerManager.container.livenessProbe.httpGet.path | string | `"/healthz"` |  |
 | controllerManager.container.livenessProbe.httpGet.port | int | `8081` |  |

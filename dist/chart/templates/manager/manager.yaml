@@ -33,7 +33,8 @@ spec:
             {{- end }}
           command:
             - /manager
-          image: {{ .Values.controllerManager.container.image.repository }}:{{ .Values.controllerManager.container.image.tag }}
+          {{- $managerTag := .Values.controllerManager.container.image.tag | default (printf "v%s" .Chart.AppVersion) }}
+          image: {{ .Values.controllerManager.container.image.repository }}:{{ $managerTag }}
           {{- if .Values.controllerManager.container.imagePullPolicy }}
           imagePullPolicy: {{ .Values.controllerManager.container.imagePullPolicy }}
           {{- end }}
@@ -42,7 +43,7 @@ spec:
             # it follows the manager image unless overridden via
             # controllerManager.container.runtimeBuilderImage.
             - name: RELATED_IMAGE_RUNTIME_BUILDER
-              value: {{ .Values.controllerManager.container.runtimeBuilderImage | default (printf "%s:%s" .Values.controllerManager.container.image.repository .Values.controllerManager.container.image.tag) }}
+              value: {{ .Values.controllerManager.container.runtimeBuilderImage | default (printf "%s:%s" .Values.controllerManager.container.image.repository $managerTag) }}
             # modal-deploy Jobs run the pinned Modal CLI against the pinned
             # upstream app source; the tag follows the chart appVersion.
             - name: RELATED_IMAGE_MODAL_DEPLOY

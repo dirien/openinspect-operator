@@ -3,8 +3,12 @@ controllerManager:
   replicas: 1
   container:
     image:
-      repository: controller
-      tag: latest
+      # -- Operator image; the release publishes ghcr.io/dirien/openinspect-operator.
+      repository: ghcr.io/dirien/openinspect-operator
+      # -- Image tag. Empty follows the chart appVersion as v<appVersion>,
+      # which matches the release tagging — a released chart installs its
+      # matching images with no overrides.
+      tag: ""
     imagePullPolicy: IfNotPresent
     # -- Image run by runtime-build Jobs (needs /runtime-builder from this
     # repository). Empty follows the manager image, which is almost always
