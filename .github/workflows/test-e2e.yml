@@ -1,9 +1,10 @@
 name: E2E Tests
 
+# Manual-only: the kind e2e takes too long for every push/PR. Run it on
+# demand from the Actions tab (or via `gh workflow run test-e2e.yml`)
+# before releases or after changes to the deploy path.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,7 +24,7 @@ jobs:
 
       - name: Install the latest version of kind
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
+          curl -Lo ./kind "https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)"
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
 
