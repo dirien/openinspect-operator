@@ -68,7 +68,7 @@ spec:
       tokenSecretSecretRef: {name: platform-secrets, key: modalTokenSecret}
       apiSecretSecretRef: {name: platform-secrets, key: modalApiSecret}
   web:
-    image: open-inspect-web:modal
+    image: open-inspect-web:modal-ce2be05
     replicas: 1
     port: 3000
     env:
