@@ -841,8 +841,8 @@ spec:
                     type: string
                   sourceRevision:
                     description: |-
-                      SourceRevision is the pinned upstream commit the artifact was built
-                      from; Digest is the canonical runtime bundle digest (sha256:...).
+                      SourceRevision is the pinned upstream commit the active artifact was
+                      built from; Digest is its canonical runtime bundle digest (sha256:...).
                     type: string
                 type: object
               workers:

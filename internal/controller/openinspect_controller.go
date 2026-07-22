@@ -28,6 +28,7 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -45,6 +46,7 @@ import (
 
 	openinspectv1alpha1 "github.com/dirien/openinspect-operator/api/v1alpha1"
 	cfclient "github.com/dirien/openinspect-operator/internal/cloudflare"
+	"github.com/dirien/openinspect-operator/internal/sandbox/provider"
 )
 
 const (
@@ -57,6 +59,10 @@ const (
 	// pendingInterval retries quickly while service bindings wait for their
 	// target workers to exist.
 	pendingInterval = 15 * time.Second
+	// runtimePendingInterval polls remote artifact builds; Job completion
+	// retriggers immediately via the Owns(Job) watch, so this only bounds
+	// provider-side state changes the cluster cannot observe.
+	runtimePendingInterval = 30 * time.Second
 
 	maxScriptBytes = 25 << 20 // Cloudflare's own bundle limit
 )
@@ -75,6 +81,11 @@ type OpenInspectReconciler struct {
 	// the informer cache (mgr.GetAPIReader()); nil falls back to Client.
 	Live client.Reader
 
+	// RuntimeBuilderImage is the image the runtime-build Job runs
+	// (--runtime-builder-image flag / RELATED_IMAGE_RUNTIME_BUILDER env);
+	// it carries the /runtime-builder binary from this repository.
+	RuntimeBuilderImage string
+
 	// NewCF is swappable in tests; defaults to cfclient.New.
 	NewCF func(accountID, apiToken, baseURL string) *cfclient.Client
 	// ModalCleanup is swappable in tests; defaults to cleanupModalApp.
@@ -83,6 +94,8 @@ type OpenInspectReconciler struct {
 	DaytonaCleanup func(context.Context, *openinspectv1alpha1.DaytonaSandboxSpec, string, map[string]struct{}) (int, error)
 	// AppSecretsURL overrides the global-secrets endpoint derivation in tests.
 	AppSecretsURL func(*openinspectv1alpha1.OpenInspect) string
+	// RuntimeInspect is swappable in tests; defaults to the provider adapter.
+	RuntimeInspect func(context.Context, *openinspectv1alpha1.OpenInspect, provider.Artifact) (provider.ArtifactState, error)
 }
 
 func (r *OpenInspectReconciler) liveReader() client.Reader {
@@ -106,6 +119,7 @@ func (r *OpenInspectReconciler) resyncInterval() time.Duration {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile drives one OpenInspect deployment to its desired state: all
 // Cloudflare resources (D1 + migrations, KV, R2, workers) plus the in-cluster
@@ -169,6 +183,18 @@ func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := timed("storage", func() error { return r.ensureStorage(ctx, oi, cf) }); err != nil {
 		return r.failed(ctx, oi, openinspectv1alpha1.ConditionStorage, "StorageFailed", err)
 	}
+	// The managed base artifact converges before the workers: the worker
+	// injection reads the artifact reference from status, and a later flip
+	// (build finished) re-uploads the control-plane worker via the hash gate.
+	var runtimePending bool
+	err = timed("runtime", func() error {
+		var rerr error
+		runtimePending, rerr = r.ensureSandboxRuntime(ctx, oi)
+		return rerr
+	})
+	if err != nil {
+		return r.failed(ctx, oi, openinspectv1alpha1.ConditionRuntime, "RuntimeFailed", err)
+	}
 	var pending int
 	err = timed("workers", func() error {
 		var werr error
@@ -186,18 +212,25 @@ func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 
 	requeue := r.resyncInterval()
-	if pending > 0 {
+	switch {
+	case pending > 0:
 		r.setCondition(oi, openinspectv1alpha1.ConditionReady, metav1.ConditionFalse,
 			"ServiceBindingsPending", fmt.Sprintf("%d service bindings wait for their target worker", pending))
 		requeue = pendingInterval
-	} else {
+	case runtimePending:
+		// The Job watch retriggers on completion; this interval only bounds
+		// remote-state polling while the provider builds.
+		r.setCondition(oi, openinspectv1alpha1.ConditionReady, metav1.ConditionFalse,
+			"RuntimeNotReady", "provider base artifact is not ready yet")
+		requeue = runtimePendingInterval
+	default:
 		r.setCondition(oi, openinspectv1alpha1.ConditionReady, metav1.ConditionTrue, "Reconciled", "all resources are up to date")
 	}
 	oi.Status.ObservedGeneration = oi.Generation
 	if err := r.persistStatus(ctx, oi); err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("reconciled", "pendingServiceBindings", pending)
+	log.Info("reconciled", "pendingServiceBindings", pending, "runtimePending", runtimePending)
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
@@ -859,6 +892,7 @@ func (r *OpenInspectReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&openinspectv1alpha1.OpenInspect{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		Owns(&batchv1.Job{}).
 		// Metadata-only watches: any change to a referenced ConfigMap/Secret
 		// re-reconciles immediately (the hash gate makes that cheap). The
 		// manager client reads these objects uncached — see cmd/main.go.

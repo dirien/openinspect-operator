@@ -22,7 +22,7 @@ func TestSweepDaytonaSandboxesDeletesOnlyOwnedSessions(t *testing.T) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/sandbox":
 			assertDaytonaFrameworkFilter(t, r.URL.Query())
-			writeDaytonaJSON(t, w, http.StatusOK, map[string]any{
+			writeDaytonaJSON(t, w, map[string]any{
 				"items": []any{
 					daytonaSandboxPayload("owned", map[string]string{
 						daytonaFrameworkLabel: daytonaFrameworkLabelValue,
@@ -39,9 +39,16 @@ func TestSweepDaytonaSandboxesDeletesOnlyOwnedSessions(t *testing.T) {
 				},
 				"nextCursor": nil,
 			})
+		case r.Method == http.MethodGet && r.URL.Path == "/sandbox/owned":
+			// TerminateSandbox re-reads the sandbox before deleting so an
+			// already-expired one is tolerated instead of failing the sweep.
+			writeDaytonaJSON(t, w, daytonaSandboxPayload("owned", map[string]string{
+				daytonaFrameworkLabel: daytonaFrameworkLabelValue,
+				daytonaSessionIDLabel: "session-owned",
+			}))
 		case r.Method == http.MethodDelete:
 			deleted = append(deleted, r.URL.Path)
-			writeDaytonaJSON(t, w, http.StatusOK, daytonaSandboxPayload("owned", nil))
+			writeDaytonaJSON(t, w, daytonaSandboxPayload("owned", nil))
 		default:
 			http.NotFound(w, r)
 		}
@@ -66,14 +73,21 @@ func TestSweepDaytonaSandboxesReturnsDeleteFailure(t *testing.T) {
 	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			writeDaytonaJSON(t, w, http.StatusOK, map[string]any{
+		if r.Method == http.MethodGet && r.URL.Path == "/sandbox" {
+			writeDaytonaJSON(t, w, map[string]any{
 				"items": []any{daytonaSandboxPayload("owned", map[string]string{
 					daytonaFrameworkLabel: daytonaFrameworkLabelValue,
 					daytonaSessionIDLabel: "session-owned",
 				})},
 				"nextCursor": nil,
 			})
+			return
+		}
+		if r.Method == http.MethodGet {
+			writeDaytonaJSON(t, w, daytonaSandboxPayload("owned", map[string]string{
+				daytonaFrameworkLabel: daytonaFrameworkLabelValue,
+				daytonaSessionIDLabel: "session-owned",
+			}))
 			return
 		}
 		http.Error(w, "temporary provider failure", http.StatusServiceUnavailable)
@@ -125,10 +139,10 @@ func daytonaSandboxPayload(id string, labels map[string]string) map[string]any {
 	}
 }
 
-func writeDaytonaJSON(t *testing.T, w http.ResponseWriter, status int, value any) {
+func writeDaytonaJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
+	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(value); err != nil {
 		t.Errorf("encode response: %v", err)
 	}

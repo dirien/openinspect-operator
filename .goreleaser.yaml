@@ -8,8 +8,21 @@ env:
   - CGO_ENABLED=0
 
 builds:
-  - binary: manager
+  - id: manager
+    binary: manager
     main: ./cmd
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+  # Ships in the same image so runtime-build Jobs can run the operator's
+  # own image (dockers_v2 copies every build into the context).
+  - id: runtime-builder
+    binary: runtime-builder
+    main: ./cmd/runtime-builder
     ldflags:
       - -s -w
     goos:

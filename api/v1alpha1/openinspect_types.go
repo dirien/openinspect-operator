@@ -532,12 +532,16 @@ const (
 	RuntimePhaseExternal = "External"
 )
 
-// SandboxRuntimeStatus records the managed provider base artifact.
+// SandboxRuntimeStatus records the managed provider base artifact. Phase
+// describes convergence toward the release's runtime digest, while
+// ArtifactName/ArtifactID/Digest/SourceRevision always describe the ACTIVE
+// artifact the control plane is wired to — during an upgrade build the old
+// reference keeps serving and only flips when the new artifact is ready.
 type SandboxRuntimeStatus struct {
 	Provider string `json:"provider,omitempty"`
 	Phase    string `json:"phase,omitempty"`
-	// SourceRevision is the pinned upstream commit the artifact was built
-	// from; Digest is the canonical runtime bundle digest (sha256:...).
+	// SourceRevision is the pinned upstream commit the active artifact was
+	// built from; Digest is its canonical runtime bundle digest (sha256:...).
 	// +optional
 	SourceRevision string `json:"sourceRevision,omitempty"`
 	// +optional

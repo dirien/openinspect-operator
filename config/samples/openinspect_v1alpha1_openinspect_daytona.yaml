@@ -57,15 +57,15 @@ spec:
       secretRef: {name: platform-secrets, key: anthropicApiKey}
   # The operator injects SANDBOX_PROVIDER=daytona, DAYTONA_API_URL,
   # DAYTONA_BASE_SNAPSHOT, DAYTONA_TARGET (if set) and the DAYTONA_API_KEY
-  # secret binding into the control-plane worker. On CR deletion the operator
-  # deletes only the Daytona sandboxes whose session labels match this
-  # deployment's D1 session index; the base snapshot is never touched.
+  # secret binding into the control-plane worker. With no baseSnapshot set,
+  # the operator builds and manages the base snapshot itself (runtime-build
+  # Job) and wires its digest-named artifact in once ready. On CR deletion
+  # only Daytona sandboxes whose session labels match this deployment's D1
+  # session index are deleted, plus the managed base artifact.
   sandbox:
     provider: daytona
     daytona:
-      # Prebuilt snapshot with the sandbox runtime; build it once with
-      # upstream packages/daytona-infra before applying this CR.
-      baseSnapshot: open-inspect-base
+      # baseSnapshot: my-prebuilt-base   # external override, used as-is
       apiUrl: https://app.daytona.io/api
       # target: us
       apiKeySecretRef: {name: platform-secrets, key: daytonaApiKey}

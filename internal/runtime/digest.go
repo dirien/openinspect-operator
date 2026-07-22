@@ -17,6 +17,10 @@ const digestSchemaVersion = 1
 
 func upstreamCommit() string { return upstream.Commit() }
 
+// UpstreamCommit exposes the pinned upstream revision the embedded runtime
+// files come from.
+func UpstreamCommit() string { return upstream.Commit() }
+
 type digestFile struct {
 	Path   string `json:"path"`
 	Mode   uint32 `json:"mode"`

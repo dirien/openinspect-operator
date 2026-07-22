@@ -64,12 +64,16 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var resyncInterval time.Duration
+	var runtimeBuilderImage string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.DurationVar(&resyncInterval, "resync-interval", 5*time.Minute,
 		"How often a Ready OpenInspect is re-reconciled to correct drift. Referenced ConfigMap/Secret "+
 			"changes roll out immediately via watches; this interval only bounds drift correction.")
+	flag.StringVar(&runtimeBuilderImage, "runtime-builder-image", os.Getenv("RELATED_IMAGE_RUNTIME_BUILDER"),
+		"Image run by runtime-build Jobs (must carry /runtime-builder from this repository, normally "+
+			"the operator's own image). Defaults to RELATED_IMAGE_RUNTIME_BUILDER.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -194,10 +198,11 @@ func main() {
 	}
 
 	if err := (&controller.OpenInspectReconciler{
-		Client:         mgr.GetClient(),
-		Scheme:         mgr.GetScheme(),
-		Live:           mgr.GetAPIReader(),
-		ResyncInterval: resyncInterval,
+		Client:              mgr.GetClient(),
+		Scheme:              mgr.GetScheme(),
+		Live:                mgr.GetAPIReader(),
+		ResyncInterval:      resyncInterval,
+		RuntimeBuilderImage: runtimeBuilderImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "OpenInspect")
 		os.Exit(1)

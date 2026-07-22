@@ -37,13 +37,16 @@ spec:
           {{- if .Values.controllerManager.container.imagePullPolicy }}
           imagePullPolicy: {{ .Values.controllerManager.container.imagePullPolicy }}
           {{- end }}
-          {{- if .Values.controllerManager.container.env }}
           env:
+            # Runtime-build Jobs run this image (it ships /runtime-builder);
+            # it follows the manager image unless overridden via
+            # controllerManager.container.runtimeBuilderImage.
+            - name: RELATED_IMAGE_RUNTIME_BUILDER
+              value: {{ .Values.controllerManager.container.runtimeBuilderImage | default (printf "%s:%s" .Values.controllerManager.container.image.repository .Values.controllerManager.container.image.tag) }}
             {{- range $key, $value := .Values.controllerManager.container.env }}
             - name: {{ $key }}
               value: {{ $value }}
             {{- end }}
-          {{- end }}
           livenessProbe:
             {{- toYaml .Values.controllerManager.container.livenessProbe | nindent 12 }}
           readinessProbe:

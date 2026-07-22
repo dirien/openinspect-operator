@@ -6,6 +6,10 @@ controllerManager:
       repository: controller
       tag: latest
     imagePullPolicy: IfNotPresent
+    # -- Image run by runtime-build Jobs (needs /runtime-builder from this
+    # repository). Empty follows the manager image, which is almost always
+    # right since the operator image ships both binaries.
+    runtimeBuilderImage: ""
     args:
       - "--leader-elect"
       - "--metrics-bind-address=:8443"

@@ -65,6 +65,12 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        env:
+          # Runtime-build Jobs run this image (it ships /runtime-builder —
+          # normally the operator's own image). Keep it in lockstep with the
+          # manager image tag when overriding IMG.
+          - name: RELATED_IMAGE_RUNTIME_BUILDER
+            value: ghcr.io/dirien/openinspect-operator:latest
         ports: []
         securityContext:
           readOnlyRootFilesystem: true
