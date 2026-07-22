@@ -15,7 +15,7 @@ func TestReferenceMatchers(t *testing.T) {
 			D1: &openinspectv1alpha1.D1Spec{MigrationsConfigMapRef: "migrations"},
 			Workers: []openinspectv1alpha1.WorkerSpec{{
 				Name:   "control-plane",
-				Script: openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "cp.js"}},
+				Script: &openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "cp.js"}},
 				Secrets: []openinspectv1alpha1.WorkerSecret{
 					{Binding: "X", SecretRef: openinspectv1alpha1.SecretKeyRef{Name: "worker-secrets", Key: "x"}},
 				},

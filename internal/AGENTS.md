@@ -13,7 +13,13 @@ Go packages implementing the operator: `controller/` (reconciliation), `cloudfla
 
 | File | Purpose |
 |------|---------|
-| `controller/openinspect_controller.go` | Reconcile pipeline: validate → claim-conflict → D1 → storage → workers → web → appSecrets; failures via `r.failed()` |
+| `controller/openinspect_controller.go` | Reconcile pipeline: validate → claim-conflict → D1 → storage → runtime → providerApp → workers → web → appSecrets; failures via `r.failed()` |
+| `controller/runtimebuild.go` | Managed Daytona base artifact: digest-named runtime-build Job, remote verification before trusting Job exit codes, active-reference flip only on Ready (D6), retire+GC hand-off |
+| `controller/modalapp.go` | Modal provider app: named-secret convergence (HMAC-gated), modal-deploy Job, endpoint discovery + health into `status.modalApp`, redeploy on pin/secret change or vanished app |
+| `controller/artifactcleanup.go` | Grace-period GC of retired artifacts; finalization deletion of managed artifacts + D1-recorded prebuild images (`image_builds`); runtime Orphan policy |
+| `sandbox/provider/` | Installer-only provider contract (base artifacts + finalization); `daytona/` builds the declarative snapshot from the runtime manifest, `modal/` wraps SDK + raw-proto seam (named secrets, FunctionGet, AppStop, image delete) |
+| `../runtime/` (internal/runtime) | Canonical runtime manifest: pinned toolchain, embedded sandbox_runtime, deterministic digest, Dockerfile renderer; parity-tested against the pinned upstream recipes |
+| `../platformbundle/` | Embedded worker bundles (hack/build-bundles.sh) + pinned D1 migrations |
 | `controller/sandbox.go` | Injects provider vars/secrets (`modal`\|`daytona`\|`vercel`\|`opencomputer`) into the control-plane worker; explicit worker values win |
 | `controller/appsecrets.go` | Converges `spec.appSecrets` into the platform's global secrets store via the control-plane worker's `/secrets` API (HMAC `timestamp.hex` bearer signed with `INTERNAL_CALLBACK_SECRET`); GET keys → PUT on change/missing → DELETE removed; never touches keys added out of band |
 | `controller/validate.go` | Terminal `InvalidSpec` checks, incl. appSecrets reserved keys and required ICS binding |
@@ -30,7 +36,8 @@ Go packages implementing the operator: `controller/` (reconciliation), `cloudfla
 
 - Full suite: `make test` (~3.5min, envtest + Ginkgo/Gomega, see `controller/suite_test.go`).
 - Single test: `go test ./internal/controller/ -run <Name>` (needs absolute `KUBEBUILDER_ASSETS` for envtest specs — prefer `make test`).
-- Reconciler test hooks: `NewCF`, `ModalCleanup`, `DaytonaCleanup`, `AppSecretsURL` — substitute provider cleanup or point HTTP paths at `httptest` servers (see `controller/appsecrets_integration_test.go`).
+- Reconciler test hooks: `NewCF`, `ModalCleanup`, `DaytonaCleanup`, `AppSecretsURL`, `RuntimeInspect`, `RuntimeDelete`, `ProviderAppEnsure`, `ModalSecretsEnsure`, `ModalDiscover`, `ModalHealthCheck`, `ProviderImageDelete` — substitute provider calls or point HTTP paths at `httptest` servers. Specs with unhooked provider paths hit real endpoints and hang behind the proxy — always hook deletion paths too (see `runtimebuild_integration_test.go`).
+- envtest has no GC controller and the Job API defaults to Orphan propagation: delete Jobs with `client.PropagationPolicy(metav1.DeletePropagationBackground)` or they wedge Terminating forever.
 - E2E: `make test-e2e` against a dedicated kind cluster only.
 
 ## Code style & conventions

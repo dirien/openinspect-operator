@@ -137,9 +137,10 @@ spec:
                   migrationsConfigMapRef:
                     description: |-
                       MigrationsConfigMapRef names a ConfigMap whose keys are numbered
-                      migration files (e.g. 0001_init.sql). They are applied in key order and
-                      tracked in a _schema_migrations table by numeric prefix, matching the
-                      upstream d1-migrate.sh semantics.
+                      migration files (e.g. 0001_init.sql), applied in key order and tracked
+                      in a _schema_migrations table by numeric prefix (upstream d1-migrate.sh
+                      semantics). Empty applies the release's embedded migrations from the
+                      pinned upstream revision; the ConfigMap is a development override.
                     type: string
                 type: object
               deletionPolicy:
@@ -595,8 +596,10 @@ spec:
                       type: string
                     script:
                       description: |-
-                        ScriptSource locates the built worker bundle (ESM, single module).
-                        Exactly one of configMapRef or url must be set.
+                        Script overrides where the worker bundle comes from (development
+                        only). Empty uses the release's embedded bundle for this worker name
+                        (control-plane, github-bot, slack-bot, linear-bot), built from the
+                        pinned upstream revision.
                       properties:
                         configMapRef:
                           description: ConfigMapKeyRef selects a key of a ConfigMap
@@ -653,7 +656,6 @@ spec:
                       type: object
                   required:
                   - name
-                  - script
                   type: object
                 maxItems: 100
                 type: array

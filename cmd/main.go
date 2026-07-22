@@ -65,6 +65,7 @@ func main() {
 	var enableHTTP2 bool
 	var resyncInterval time.Duration
 	var runtimeBuilderImage string
+	var modalDeployImage string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -74,6 +75,9 @@ func main() {
 	flag.StringVar(&runtimeBuilderImage, "runtime-builder-image", os.Getenv("RELATED_IMAGE_RUNTIME_BUILDER"),
 		"Image run by runtime-build Jobs (must carry /runtime-builder from this repository, normally "+
 			"the operator's own image). Defaults to RELATED_IMAGE_RUNTIME_BUILDER.")
+	flag.StringVar(&modalDeployImage, "modal-deploy-image", os.Getenv("RELATED_IMAGE_MODAL_DEPLOY"),
+		"Image run by modal-deploy Jobs (carries the pinned Modal CLI and upstream app source, "+
+			"built from Dockerfile.modal-deploy). Defaults to RELATED_IMAGE_MODAL_DEPLOY.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -203,6 +207,7 @@ func main() {
 		Live:                mgr.GetAPIReader(),
 		ResyncInterval:      resyncInterval,
 		RuntimeBuilderImage: runtimeBuilderImage,
+		ModalDeployImage:    modalDeployImage,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "OpenInspect")
 		os.Exit(1)

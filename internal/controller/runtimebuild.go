@@ -88,11 +88,11 @@ func runtimeBuildJobName(oi *openinspectv1alpha1.OpenInspect, shortDigest string
 func (r *OpenInspectReconciler) ensureSandboxRuntime(ctx context.Context, oi *openinspectv1alpha1.OpenInspect) (pending bool, err error) {
 	sb := oi.Spec.Sandbox
 	if sb == nil || sb.Provider != providerDaytona {
-		// Modal's base image belongs to the deployed upstream app
-		// (ProviderAppReady covers it); other providers have no managed
-		// artifact (D3). Drop leftovers from a provider switch.
+		// No provider-owned artifact to manage: Modal's base image belongs
+		// to the deployed upstream app (ensureModalApp owns the RuntimeReady
+		// condition there); other providers have no managed artifact (D3).
+		oi.Status.SandboxRuntime = nil
 		if sb == nil || sb.Provider != providerModal {
-			oi.Status.SandboxRuntime = nil
 			meta.RemoveStatusCondition(&oi.Status.Conditions, openinspectv1alpha1.ConditionRuntime)
 		}
 		return false, nil
@@ -137,6 +137,10 @@ func (r *OpenInspectReconciler) ensureSandboxRuntime(ctx context.Context, oi *op
 			"UpdatePolicyNever", fmt.Sprintf("holding artifact %s; digest %s not rolled out (updatePolicy: Never)", st.ArtifactName, target.shortDigest))
 		return false, nil
 	}
+
+	// Superseded artifacts past their rollback grace period are collected
+	// here, on the ordinary reconcile cadence (D6).
+	r.gcRetiredArtifacts(ctx, oi)
 
 	job := &batchv1.Job{}
 	jobName := runtimeBuildJobName(oi, target.shortDigest)

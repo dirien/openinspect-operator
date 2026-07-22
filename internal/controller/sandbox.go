@@ -174,3 +174,42 @@ func validateSandbox(sb *openinspectv1alpha1.SandboxSpec, workers map[string]boo
 	}
 	return nil
 }
+
+// validateModalAppInputs checks that everything the operator-deployed
+// upstream Modal app resolves at deploy time (its three named secrets) is
+// present in the spec — a deploy without them fails remotely, so catch it
+// as a terminal InvalidSpec instead of an endless Job retry loop.
+func validateModalAppInputs(oi *openinspectv1alpha1.OpenInspect) error {
+	sb := oi.Spec.Sandbox
+	if sb == nil || sb.Provider != providerModal {
+		return nil
+	}
+	hasAnthropic := false
+	for _, s := range oi.Spec.AppSecrets {
+		if s.Key == "ANTHROPIC_API_KEY" {
+			hasAnthropic = true
+		}
+	}
+	if !hasAnthropic {
+		return fmt.Errorf("provider modal requires an ANTHROPIC_API_KEY entry in spec.appSecrets: the upstream Modal app resolves it as its llm-api-keys secret")
+	}
+	name := controlPlaneWorkerName(oi)
+	bindings := map[string]bool{}
+	for _, w := range oi.Spec.Workers {
+		if w.Name != name {
+			continue
+		}
+		for _, s := range w.Secrets {
+			bindings[s.Binding] = true
+		}
+	}
+	for _, required := range modalGitHubAppBindings {
+		if !bindings[required] {
+			return fmt.Errorf("provider modal requires a %s secret binding on worker %q: the upstream Modal app resolves it as its github-app secret", required, name)
+		}
+	}
+	if !bindings[internalCallbackSecretBinding] {
+		return fmt.Errorf("provider modal requires an %s secret binding on worker %q: the upstream Modal app resolves it as its internal-api secret", internalCallbackSecretBinding, name)
+	}
+	return nil
+}

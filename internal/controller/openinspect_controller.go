@@ -46,7 +46,9 @@ import (
 
 	openinspectv1alpha1 "github.com/dirien/openinspect-operator/api/v1alpha1"
 	cfclient "github.com/dirien/openinspect-operator/internal/cloudflare"
+	"github.com/dirien/openinspect-operator/internal/platformbundle"
 	"github.com/dirien/openinspect-operator/internal/sandbox/provider"
+	modalprovider "github.com/dirien/openinspect-operator/internal/sandbox/provider/modal"
 )
 
 const (
@@ -85,6 +87,10 @@ type OpenInspectReconciler struct {
 	// (--runtime-builder-image flag / RELATED_IMAGE_RUNTIME_BUILDER env);
 	// it carries the /runtime-builder binary from this repository.
 	RuntimeBuilderImage string
+	// ModalDeployImage is the image the modal-deploy Job runs
+	// (--modal-deploy-image flag / RELATED_IMAGE_MODAL_DEPLOY env); it
+	// carries the pinned Modal CLI and the pinned upstream app source.
+	ModalDeployImage string
 
 	// NewCF is swappable in tests; defaults to cfclient.New.
 	NewCF func(accountID, apiToken, baseURL string) *cfclient.Client
@@ -96,6 +102,22 @@ type OpenInspectReconciler struct {
 	AppSecretsURL func(*openinspectv1alpha1.OpenInspect) string
 	// RuntimeInspect is swappable in tests; defaults to the provider adapter.
 	RuntimeInspect func(context.Context, *openinspectv1alpha1.OpenInspect, provider.Artifact) (provider.ArtifactState, error)
+	// ProviderAppEnsure replaces the whole provider-app reconciliation in
+	// tests; defaults to ensureProviderApp.
+	ProviderAppEnsure func(context.Context, *openinspectv1alpha1.OpenInspect, *cfclient.Client) (bool, error)
+	// ModalSecretsEnsure is swappable in tests; defaults to the adapter's
+	// named-secret convergence.
+	ModalSecretsEnsure func(context.Context, modalprovider.Config, map[string]map[string]string) error
+	// ModalDiscover is swappable in tests; defaults to the adapter's
+	// endpoint discovery.
+	ModalDiscover func(context.Context, *openinspectv1alpha1.OpenInspect) (modalprovider.Endpoints, error)
+	// ModalHealthCheck is swappable in tests; defaults to an HTTP GET.
+	ModalHealthCheck func(context.Context, string) error
+	// RuntimeDelete is swappable in tests; defaults to the Daytona adapter.
+	RuntimeDelete func(context.Context, *openinspectv1alpha1.OpenInspect, provider.Artifact) error
+	// ProviderImageDelete is swappable in tests; defaults to the provider
+	// adapters (Modal image delete / Daytona snapshot delete).
+	ProviderImageDelete func(context.Context, *openinspectv1alpha1.OpenInspect, cfclient.ImageRef) error
 }
 
 func (r *OpenInspectReconciler) liveReader() client.Reader {
@@ -195,6 +217,21 @@ func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err != nil {
 		return r.failed(ctx, oi, openinspectv1alpha1.ConditionRuntime, "RuntimeFailed", err)
 	}
+	// The provider-side application (the upstream Modal app) also converges
+	// before the workers: the injected web suffix is discovered from it.
+	var appPending bool
+	err = timed("providerapp", func() error {
+		ensure := r.ProviderAppEnsure
+		if ensure == nil {
+			ensure = r.ensureProviderApp
+		}
+		var aerr error
+		appPending, aerr = ensure(ctx, oi, cf)
+		return aerr
+	})
+	if err != nil {
+		return r.failed(ctx, oi, openinspectv1alpha1.ConditionProviderApp, "ProviderAppFailed", err)
+	}
 	var pending int
 	err = timed("workers", func() error {
 		var werr error
@@ -223,6 +260,10 @@ func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		r.setCondition(oi, openinspectv1alpha1.ConditionReady, metav1.ConditionFalse,
 			"RuntimeNotReady", "provider base artifact is not ready yet")
 		requeue = runtimePendingInterval
+	case appPending:
+		r.setCondition(oi, openinspectv1alpha1.ConditionReady, metav1.ConditionFalse,
+			"ProviderAppNotReady", "provider application is not deployed and healthy yet")
+		requeue = runtimePendingInterval
 	default:
 		r.setCondition(oi, openinspectv1alpha1.ConditionReady, metav1.ConditionTrue, "Reconciled", "all resources are up to date")
 	}
@@ -230,7 +271,7 @@ func (r *OpenInspectReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err := r.persistStatus(ctx, oi); err != nil {
 		return ctrl.Result{}, err
 	}
-	log.Info("reconciled", "pendingServiceBindings", pending, "runtimePending", runtimePending)
+	log.Info("reconciled", "pendingServiceBindings", pending, "runtimePending", runtimePending, "providerAppPending", appPending)
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
@@ -302,16 +343,26 @@ func (r *OpenInspectReconciler) ensureD1(ctx context.Context, oi *openinspectv1a
 	}
 	oi.Status.D1DatabaseID = id
 
+	// Default: the release's embedded migrations from the pinned upstream
+	// revision; a ConfigMap ref is the development override.
+	var migrations map[string]string
 	if ref := oi.Spec.D1.MigrationsConfigMapRef; ref != "" {
 		cm := &corev1.ConfigMap{}
 		if err := r.Get(ctx, types.NamespacedName{Namespace: oi.Namespace, Name: ref}, cm); err != nil {
 			return fmt.Errorf("migrations configmap: %w", err)
 		}
-		applied, err := cf.ApplyMigrations(ctx, id, cm.Data)
-		oi.Status.AppliedMigrations = applied
+		migrations = cm.Data
+	} else {
+		var err error
+		migrations, err = platformbundle.Migrations()
 		if err != nil {
 			return err
 		}
+	}
+	applied, err := cf.ApplyMigrations(ctx, id, migrations)
+	oi.Status.AppliedMigrations = applied
+	if err != nil {
+		return err
 	}
 	r.setCondition(oi, openinspectv1alpha1.ConditionD1, metav1.ConditionTrue, "Reconciled",
 		fmt.Sprintf("database %s ready, %d migrations applied", id, oi.Status.AppliedMigrations))
@@ -557,6 +608,10 @@ func (r *OpenInspectReconciler) uploadWorkerVersion(ctx context.Context, oi *ope
 }
 
 func (r *OpenInspectReconciler) scriptContent(ctx context.Context, namespace string, w openinspectv1alpha1.WorkerSpec) ([]byte, error) {
+	// No override: the release's embedded bundle for this worker name.
+	if w.Script == nil {
+		return platformbundle.Script(w.Name)
+	}
 	switch {
 	case w.Script.ConfigMapRef != nil:
 		cm := &corev1.ConfigMap{}
@@ -772,6 +827,14 @@ func (r *OpenInspectReconciler) reconcileDelete(ctx context.Context, oi *openins
 		// Provider cleanup precedes the rest of the Cloudflare teardown
 		// because Daytona reads the CR-owned D1 session index.
 		if err := r.cleanupProviderSandboxes(ctx, oi, cf); err != nil {
+			return ctrl.Result{}, err
+		}
+		// Recorded prebuild images and the managed base artifact go next,
+		// both before D1 (the image evidence) disappears below.
+		if err := r.cleanupProviderImages(ctx, oi, cf); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.cleanupManagedArtifact(ctx, oi); err != nil {
 			return ctrl.Result{}, err
 		}
 

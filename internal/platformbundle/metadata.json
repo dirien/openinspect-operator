@@ -1,0 +1,22 @@
+{
+  "upstreamCommit": "ce2be05f5310a8f7b9c1bc328a176534ced63d75",
+  "esbuild": "0.28.1",
+  "bundles": {
+    "control-plane": {
+      "sha256": "8b7404d252389fbf4087192b707e53d567cdffb37fdd1fbedbd600cb151ce273",
+      "bytes": 1990559
+    },
+    "github-bot": {
+      "sha256": "72f172730e47ad53bec77287f521567ba33519934154f637e7871711a93ac76c",
+      "bytes": 1083697
+    },
+    "linear-bot": {
+      "sha256": "f7f237b309cb6b0072025b06e898b25c9538ac22eada5619f061e6a3fe7b6e87",
+      "bytes": 1127250
+    },
+    "slack-bot": {
+      "sha256": "ed4487a6ba89f2271034651429b148cc876e8869558f51a67aeecdb1ae79e753",
+      "bytes": 1303453
+    }
+  }
+}

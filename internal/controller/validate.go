@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	openinspectv1alpha1 "github.com/dirien/openinspect-operator/api/v1alpha1"
+	"github.com/dirien/openinspect-operator/internal/platformbundle"
 )
 
 // claimConflict returns the namespace/name of an older OpenInspect that
@@ -89,6 +90,9 @@ func validateSpec(oi *openinspectv1alpha1.OpenInspect) error {
 	if err := validateSandbox(oi.Spec.Sandbox, workers); err != nil {
 		return err
 	}
+	if err := validateModalAppInputs(oi); err != nil {
+		return err
+	}
 	for _, w := range oi.Spec.Workers {
 		if len(w.Bindings.D1) > 0 && oi.Spec.D1 == nil {
 			return fmt.Errorf("worker %q has a d1 binding but spec.d1 is not set", w.Name)
@@ -108,7 +112,15 @@ func validateSpec(oi *openinspectv1alpha1.OpenInspect) error {
 				return fmt.Errorf("worker %q service binding %q references undefined worker %q", w.Name, b.Binding, b.Worker)
 			}
 		}
-		if (w.Script.ConfigMapRef == nil) == (w.Script.URL == "") {
+		switch {
+		case w.Script == nil:
+			// No override means the release's embedded bundle; only known
+			// platform workers have one.
+			if !platformbundle.Has(w.Name) {
+				names, _ := platformbundle.Names()
+				return fmt.Errorf("worker %q has no built-in bundle (available: %v); set script.configMapRef or script.url", w.Name, names)
+			}
+		case (w.Script.ConfigMapRef == nil) == (w.Script.URL == ""):
 			return fmt.Errorf("worker %q script needs exactly one of configMapRef or url", w.Name)
 		}
 	}

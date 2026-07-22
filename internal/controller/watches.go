@@ -17,7 +17,7 @@ func referencesConfigMap(oi *openinspectv1alpha1.OpenInspect, name string) bool 
 		return true
 	}
 	for _, w := range oi.Spec.Workers {
-		if w.Script.ConfigMapRef != nil && w.Script.ConfigMapRef.Name == name {
+		if w.Script != nil && w.Script.ConfigMapRef != nil && w.Script.ConfigMapRef.Name == name {
 			return true
 		}
 	}

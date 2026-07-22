@@ -135,6 +135,42 @@ func (c *Client) D1SessionIDs(ctx context.Context, databaseID string) (ids []str
 	return ids, true, nil
 }
 
+// ImageRef is one provider prebuilt image recorded by the platform.
+type ImageRef struct {
+	Provider string
+	ImageID  string
+}
+
+// D1ImageBuildRefs returns the provider image references recorded in this
+// deployment's image_builds table (repo/environment prebuilds). Finalizers
+// delete these provider-side artifacts before D1 itself goes away. found is
+// false when the table or database does not exist — older schemas or a
+// vanished database degrade to a skipped image sweep instead of wedging the
+// finalizer.
+func (c *Client) D1ImageBuildRefs(ctx context.Context, databaseID string) (refs []ImageRef, found bool, err error) {
+	rows, err := c.d1Query(ctx, databaseID,
+		"SELECT DISTINCT provider, provider_image_id FROM image_builds WHERE provider_image_id IS NOT NULL AND provider_image_id != ''")
+	if err != nil {
+		if isNotFound(err) || strings.Contains(strings.ToLower(err.Error()), "no such table") {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("read image builds from d1: %w", err)
+	}
+	for _, row := range rows {
+		values, ok := row.(map[string]any)
+		if !ok {
+			return nil, false, fmt.Errorf("read image builds from d1: unexpected row type %T", row)
+		}
+		provider, _ := values["provider"].(string)
+		imageID, _ := values["provider_image_id"].(string)
+		if provider == "" || imageID == "" {
+			continue
+		}
+		refs = append(refs, ImageRef{Provider: provider, ImageID: imageID})
+	}
+	return refs, true, nil
+}
+
 var migrationPrefix = regexp.MustCompile(`^\d+`)
 
 // ApplyMigrations applies pending migrations in key order, tracked in

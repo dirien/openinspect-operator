@@ -71,6 +71,10 @@ spec:
           # manager image tag when overriding IMG.
           - name: RELATED_IMAGE_RUNTIME_BUILDER
             value: ghcr.io/dirien/openinspect-operator:latest
+          # modal-deploy Jobs run this image (pinned Modal CLI + pinned
+          # upstream app source, Dockerfile.modal-deploy).
+          - name: RELATED_IMAGE_MODAL_DEPLOY
+            value: ghcr.io/dirien/openinspect-modal-deploy:latest
         ports: []
         securityContext:
           readOnlyRootFilesystem: true

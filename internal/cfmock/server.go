@@ -226,15 +226,13 @@ func (s *Server) d1Query(w http.ResponseWriter, r *http.Request) {
 			results = append(results, row)
 		}
 	} else {
-		// D1 executes semicolon-joined statements as a batch.
-		for stmt := range strings.SplitSeq(body.Sql, ";") {
-			if strings.TrimSpace(stmt) == "" {
-				continue
-			}
-			if _, err := db.Exec(stmt); err != nil {
-				apiError(w, http.StatusBadRequest, 7500, fmt.Sprintf("%s: %s", err, stmt))
-				return
-			}
+		// D1 executes semicolon-joined statements as a batch. Hand the whole
+		// batch to SQLite instead of splitting on ";" here: real upstream
+		// migrations contain semicolons inside SQL comments (and could in
+		// string literals), which a naive split corrupts.
+		if _, err := db.Exec(body.Sql); err != nil {
+			apiError(w, http.StatusBadRequest, 7500, fmt.Sprintf("%s: %s", err, body.Sql))
+			return
 		}
 	}
 	ok(w, []map[string]any{{"success": true, "results": results, "meta": map[string]any{}}})

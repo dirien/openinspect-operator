@@ -10,6 +10,10 @@ controllerManager:
     # repository). Empty follows the manager image, which is almost always
     # right since the operator image ships both binaries.
     runtimeBuilderImage: ""
+    # -- Image run by modal-deploy Jobs (pinned Modal CLI + pinned upstream
+    # app source). Empty selects the release-matched
+    # ghcr.io/dirien/openinspect-modal-deploy image.
+    modalDeployImage: ""
     args:
       - "--leader-elect"
       - "--metrics-bind-address=:8443"

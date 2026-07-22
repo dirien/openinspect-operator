@@ -60,10 +60,21 @@ var _ = Describe("Provider sweep on deletion", func() {
 	BeforeEach(func() {
 		mock = httptest.NewServer(cfmock.New().Handler())
 		DeferCleanup(mock.Close)
+		store := &fakeSecretsAPI{secret: "ics-test", store: map[string]string{}}
+		storeServer := httptest.NewServer(store.handler(GinkgoT()))
+		DeferCleanup(storeServer.Close)
 		reconciler = &OpenInspectReconciler{
 			Client:   k8sClient,
 			Scheme:   scheme.Scheme,
 			Recorder: record.NewFakeRecorder(100),
+			// This suite covers deletion sweeps; the provider-app flow has
+			// its own Describe block.
+			ProviderAppEnsure: func(context.Context, *openinspectv1alpha1.OpenInspect, *cfclient.Client) (bool, error) {
+				return false, nil
+			},
+			AppSecretsURL: func(*openinspectv1alpha1.OpenInspect) string {
+				return storeServer.URL + "/secrets"
+			},
 		}
 
 		objs := []client.Object{
@@ -78,6 +89,11 @@ var _ = Describe("Provider sweep on deletion", func() {
 					"modalTokenId":     "ak-test",
 					"modalTokenSecret": "as-test",
 					"modalApiSecret":   "api-test",
+					"ics":              "ics-test",
+					"ghAppId":          "1",
+					"ghAppKey":         "rsa",
+					"ghAppInstall":     "2",
+					"anthropic":        "sk-ant-test",
 				},
 			},
 			&corev1.ConfigMap{
@@ -108,7 +124,7 @@ var _ = Describe("Provider sweep on deletion", func() {
 				D1: &openinspectv1alpha1.D1Spec{MigrationsConfigMapRef: "ps-migrations"},
 				Workers: []openinspectv1alpha1.WorkerSpec{{
 					Name:     "control-plane",
-					Script:   openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "ps-bundles", Key: "cp.js"}},
+					Script:   &openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "ps-bundles", Key: "cp.js"}},
 					Bindings: openinspectv1alpha1.WorkerBindings{D1: []openinspectv1alpha1.D1Binding{{Binding: "DB"}}},
 				}},
 				Sandbox: &openinspectv1alpha1.SandboxSpec{
@@ -186,6 +202,17 @@ var _ = Describe("Provider sweep on deletion", func() {
 				APISecretSecretRef:   openinspectv1alpha1.SecretKeyRef{Name: "ps-secrets", Key: "modalApiSecret"},
 			},
 		}
+		// Provider modal requires the upstream app inputs to pass validation.
+		ref := func(key string) openinspectv1alpha1.SecretKeyRef {
+			return openinspectv1alpha1.SecretKeyRef{Name: "ps-secrets", Key: key}
+		}
+		oi.Spec.Workers[0].Secrets = []openinspectv1alpha1.WorkerSecret{
+			{Binding: "INTERNAL_CALLBACK_SECRET", SecretRef: ref("ics")},
+			{Binding: "GITHUB_APP_ID", SecretRef: ref("ghAppId")},
+			{Binding: "GITHUB_APP_PRIVATE_KEY", SecretRef: ref("ghAppKey")},
+			{Binding: "GITHUB_APP_INSTALLATION_ID", SecretRef: ref("ghAppInstall")},
+		}
+		oi.Spec.AppSecrets = []openinspectv1alpha1.AppSecret{{Key: "ANTHROPIC_API_KEY", SecretRef: ref("anthropic")}}
 		key := types.NamespacedName{Name: oi.Name, Namespace: ns}
 		Expect(k8sClient.Create(ctx, oi)).To(Succeed())
 		Expect(reconcile(key)).To(Succeed())

@@ -43,6 +43,10 @@ spec:
             # controllerManager.container.runtimeBuilderImage.
             - name: RELATED_IMAGE_RUNTIME_BUILDER
               value: {{ .Values.controllerManager.container.runtimeBuilderImage | default (printf "%s:%s" .Values.controllerManager.container.image.repository .Values.controllerManager.container.image.tag) }}
+            # modal-deploy Jobs run the pinned Modal CLI against the pinned
+            # upstream app source; the tag follows the chart appVersion.
+            - name: RELATED_IMAGE_MODAL_DEPLOY
+              value: {{ .Values.controllerManager.container.modalDeployImage | default (printf "ghcr.io/dirien/openinspect-modal-deploy:v%s" .Chart.AppVersion) }}
             {{- range $key, $value := .Values.controllerManager.container.env }}
             - name: {{ $key }}
               value: {{ $value }}

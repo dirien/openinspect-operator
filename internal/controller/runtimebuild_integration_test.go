@@ -55,7 +55,7 @@ var _ = Describe("Managed sandbox runtime", func() {
 			},
 			Workers: []openinspectv1alpha1.WorkerSpec{{
 				Name:   "control-plane",
-				Script: openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
+				Script: &openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
 			}},
 			Sandbox: &openinspectv1alpha1.SandboxSpec{
 				Provider: "daytona",
@@ -87,6 +87,11 @@ var _ = Describe("Managed sandbox runtime", func() {
 			RuntimeInspect: func(context.Context, *openinspectv1alpha1.OpenInspect, provider.Artifact) (provider.ArtifactState, error) {
 				return inspect, inspectErr
 			},
+			// Finalization deletes managed artifacts; never let it reach the
+			// real adapter (and its unresolvable test endpoint) from here.
+			RuntimeDelete: func(context.Context, *openinspectv1alpha1.OpenInspect, provider.Artifact) error {
+				return nil
+			},
 		}
 		objs := []client.Object{
 			&corev1.Secret{
@@ -115,6 +120,13 @@ var _ = Describe("Managed sandbox runtime", func() {
 		// succeeds because provider cleanup is skipped without session
 		// evidence.
 		_ = reconcile()
+		// Last resort so one failed spec can never wedge the rest of the
+		// suite behind a terminating CR.
+		latest := &openinspectv1alpha1.OpenInspect{}
+		if err := k8sClient.Get(ctx, key, latest); err == nil {
+			latest.Finalizers = nil
+			_ = k8sClient.Update(ctx, latest)
+		}
 		jobs := &batchv1.JobList{}
 		_ = k8sClient.List(ctx, jobs, client.InNamespace(ns))
 		for i := range jobs.Items {

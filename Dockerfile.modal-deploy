@@ -1,0 +1,27 @@
+# modal-deploy Job image: the pinned Modal CLI plus the pinned upstream
+# Modal app source (EPIC1 D5 — the single scoped CLI exception). The Job
+# only sets MODAL_TOKEN_ID / MODAL_TOKEN_SECRET / MODAL_ENVIRONMENT; the
+# dependency set is resolved from upstream's uv.lock at image build time, so
+# the Job itself performs no dependency fetching.
+FROM python:3.12-slim-bookworm
+
+RUN pip install --no-cache-dir uv==0.11.31
+
+# Layout mirrors the upstream repository: modal-infra's pyproject resolves
+# open-inspect-sandbox-runtime as ../sandbox-runtime.
+WORKDIR /app
+COPY third_party/background-agents/UPSTREAM_COMMIT UPSTREAM_COMMIT
+COPY third_party/background-agents/packages/sandbox-runtime packages/sandbox-runtime
+COPY third_party/background-agents/packages/modal-infra packages/modal-infra
+
+WORKDIR /app/packages/modal-infra
+RUN uv sync --frozen --no-dev
+
+# Run as non-root; the Modal CLI writes state under HOME and /tmp only.
+RUN chown -R 65532:65532 /app
+USER 65532:65532
+ENV HOME=/tmp
+
+# modal reads MODAL_TOKEN_ID/MODAL_TOKEN_SECRET/MODAL_ENVIRONMENT from the
+# environment. --no-sync: the environment was frozen at image build.
+ENTRYPOINT ["uv", "run", "--no-sync", "modal", "deploy", "deploy.py"]

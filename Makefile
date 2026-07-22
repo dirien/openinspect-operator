@@ -155,6 +155,11 @@ RUNTIME_IMG ?= ghcr.io/dirien/openinspect-sandbox-runtime:dev
 docker-build-runtime: generate-runtime ## Build the sandbox runtime base image from Dockerfile.runtime.
 	$(CONTAINER_TOOL) build --platform linux/amd64 -f Dockerfile.runtime -t ${RUNTIME_IMG} .
 
+MODAL_DEPLOY_IMG ?= ghcr.io/dirien/openinspect-modal-deploy:dev
+.PHONY: docker-build-modal-deploy
+docker-build-modal-deploy: ## Build the modal-deploy Job image (pinned Modal CLI + upstream app source).
+	$(CONTAINER_TOOL) build -f Dockerfile.modal-deploy -t ${MODAL_DEPLOY_IMG} .
+
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}

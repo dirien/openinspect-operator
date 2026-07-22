@@ -90,6 +90,30 @@ jobs:
       - name: Sign sandbox runtime image
         run: cosign sign --yes "ghcr.io/dirien/openinspect-sandbox-runtime@${{ steps.runtime-push.outputs.digest }}"
 
+      # The modal-deploy Job image: pinned Modal CLI + pinned upstream app
+      # source (EPIC1 D5). Version-tagged and signed like the others.
+      - name: Build and push modal-deploy image
+        id: modal-deploy-push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          file: Dockerfile.modal-deploy
+          platforms: linux/amd64,linux/arm64
+          push: true
+          sbom: true
+          provenance: mode=max
+          tags: |
+            ghcr.io/dirien/openinspect-modal-deploy:${{ github.ref_name }}
+            ghcr.io/dirien/openinspect-modal-deploy:${{ steps.runtime-meta.outputs.majorminor }}
+            ghcr.io/dirien/openinspect-modal-deploy:latest
+          labels: |
+            org.opencontainers.image.version=${{ steps.runtime-meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            dev.dirien.openinspect.upstream-commit=${{ steps.runtime-meta.outputs.upstream }}
+
+      - name: Sign modal-deploy image
+        run: cosign sign --yes "ghcr.io/dirien/openinspect-modal-deploy@${{ steps.modal-deploy-push.outputs.digest }}"
+
       - name: Install Helm
         uses: azure/setup-helm@dda3372f752e03dde6b3237bc9431cdc2f7a02a2 # v5.0.0
 

@@ -38,6 +38,7 @@ import (
 
 	openinspectv1alpha1 "github.com/dirien/openinspect-operator/api/v1alpha1"
 	"github.com/dirien/openinspect-operator/internal/cfmock"
+	cfclient "github.com/dirien/openinspect-operator/internal/cloudflare"
 )
 
 type mockState struct {
@@ -75,6 +76,22 @@ var _ = Describe("OpenInspect Controller", func() {
 		return err
 	}
 
+	// cpSecretBindings are the control-plane worker secret bindings a valid
+	// Modal spec must carry (the operator feeds them into the upstream
+	// app's named Modal secrets).
+	cpSecretBindings := func() []openinspectv1alpha1.WorkerSecret {
+		ref := func(key string) openinspectv1alpha1.SecretKeyRef {
+			return openinspectv1alpha1.SecretKeyRef{Name: "cp-secrets", Key: key}
+		}
+		return []openinspectv1alpha1.WorkerSecret{
+			{Binding: "GITHUB_CLIENT_SECRET", SecretRef: ref("githubClientSecret")},
+			{Binding: "INTERNAL_CALLBACK_SECRET", SecretRef: ref("internalCallbackSecret")},
+			{Binding: "GITHUB_APP_ID", SecretRef: ref("githubAppId")},
+			{Binding: "GITHUB_APP_PRIVATE_KEY", SecretRef: ref("githubAppPrivateKey")},
+			{Binding: "GITHUB_APP_INSTALLATION_ID", SecretRef: ref("githubAppInstallationId")},
+		}
+	}
+
 	// modalSpec is a minimal valid spec with a Modal sandbox, parameterized on
 	// the api-secret ref so tests can point it at a deletable secret.
 	modalSpec := func(deploymentName string, apiRef openinspectv1alpha1.SecretKeyRef) openinspectv1alpha1.OpenInspectSpec {
@@ -86,8 +103,13 @@ var _ = Describe("OpenInspect Controller", func() {
 				APIBaseURL:        mock.URL,
 			},
 			Workers: []openinspectv1alpha1.WorkerSpec{{
-				Name:   "control-plane",
-				Script: openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
+				Name:    "control-plane",
+				Script:  &openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
+				Secrets: cpSecretBindings(),
+			}},
+			AppSecrets: []openinspectv1alpha1.AppSecret{{
+				Key:       "ANTHROPIC_API_KEY",
+				SecretRef: openinspectv1alpha1.SecretKeyRef{Name: "cp-secrets", Key: "anthropicApiKey"},
 			}},
 			Sandbox: &openinspectv1alpha1.SandboxSpec{
 				Provider: "modal",
@@ -104,6 +126,9 @@ var _ = Describe("OpenInspect Controller", func() {
 	BeforeEach(func() {
 		mock = httptest.NewServer(cfmock.New().Handler())
 		DeferCleanup(mock.Close)
+		store := &fakeSecretsAPI{secret: "ics-hunter2", store: map[string]string{}}
+		storeServer := httptest.NewServer(store.handler(GinkgoT()))
+		DeferCleanup(storeServer.Close)
 		sweepCalls = 0
 		stopCalls = 0
 		reconciler = &OpenInspectReconciler{
@@ -115,6 +140,14 @@ var _ = Describe("OpenInspect Controller", func() {
 				stopCalls++
 				return 2, true, nil
 			},
+			// These specs cover the Cloudflare/platform surface; the
+			// provider-app flow has its own Describe block.
+			ProviderAppEnsure: func(context.Context, *openinspectv1alpha1.OpenInspect, *cfclient.Client) (bool, error) {
+				return false, nil
+			},
+			AppSecretsURL: func(*openinspectv1alpha1.OpenInspect) string {
+				return storeServer.URL + "/secrets"
+			},
 		}
 
 		objs := []client.Object{
@@ -125,10 +158,16 @@ var _ = Describe("OpenInspect Controller", func() {
 			&corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: "cp-secrets", Namespace: ns},
 				StringData: map[string]string{
-					"githubClientSecret": "gh-hunter2",
-					"modalTokenId":       "ak-test-id",
-					"modalTokenSecret":   "as-test-secret",
-					"modalApiSecret":     "modal-api-hunter2",
+					"githubClientSecret":      "gh-hunter2",
+					"modalTokenId":            "ak-test-id",
+					"modalTokenSecret":        "as-test-secret",
+					"modalApiSecret":          "modal-api-hunter2",
+					"internalCallbackSecret":  "ics-hunter2",
+					"githubAppId":             "12345",
+					"githubAppPrivateKey":     "-----BEGIN RSA TEST KEY-----",
+					"githubAppInstallationId": "67890",
+					"anthropicApiKey":         "sk-ant-test",
+					"daytonaApiKey":           "dtn-hunter2",
 				},
 			},
 			&corev1.ConfigMap{
@@ -168,7 +207,7 @@ var _ = Describe("OpenInspect Controller", func() {
 				Workers: []openinspectv1alpha1.WorkerSpec{
 					{
 						Name:   "control-plane",
-						Script: openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
+						Script: &openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
 						Bindings: openinspectv1alpha1.WorkerBindings{
 							D1:             []openinspectv1alpha1.D1Binding{{Binding: "DB"}},
 							KV:             []openinspectv1alpha1.KVBinding{{Binding: "REPOS_CACHE", Namespace: "session-index"}},
@@ -177,17 +216,21 @@ var _ = Describe("OpenInspect Controller", func() {
 							Services:       []openinspectv1alpha1.ServiceBinding{{Binding: "SLACK_BOT", Worker: "slack-bot"}},
 						},
 						Vars:    map[string]string{"APP_NAME": "Open Inspect"},
-						Secrets: []openinspectv1alpha1.WorkerSecret{{Binding: "GITHUB_CLIENT_SECRET", SecretRef: openinspectv1alpha1.SecretKeyRef{Name: "cp-secrets", Key: "githubClientSecret"}}},
+						Secrets: cpSecretBindings(),
 						Cron:    []string{"* * * * *"},
 					},
 					{
 						Name:   "slack-bot",
-						Script: openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "slack-bot.js"}},
+						Script: &openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "slack-bot.js"}},
 						Bindings: openinspectv1alpha1.WorkerBindings{
 							Services: []openinspectv1alpha1.ServiceBinding{{Binding: "CONTROL_PLANE", Worker: "control-plane"}},
 						},
 					},
 				},
+				AppSecrets: []openinspectv1alpha1.AppSecret{{
+					Key:       "ANTHROPIC_API_KEY",
+					SecretRef: openinspectv1alpha1.SecretKeyRef{Name: "cp-secrets", Key: "anthropicApiKey"},
+				}},
 				Sandbox: &openinspectv1alpha1.SandboxSpec{
 					Provider: "modal",
 					Modal: &openinspectv1alpha1.ModalSandboxSpec{
@@ -326,7 +369,7 @@ var _ = Describe("OpenInspect Controller", func() {
 				},
 				Workers: []openinspectv1alpha1.WorkerSpec{{
 					Name:   "control-plane",
-					Script: openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
+					Script: &openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
 					Bindings: openinspectv1alpha1.WorkerBindings{
 						KV: []openinspectv1alpha1.KVBinding{{Binding: "X", Namespace: "does-not-exist"}},
 					},
@@ -471,7 +514,7 @@ var _ = Describe("OpenInspect Controller", func() {
 			R2Buckets:    []string{"media"},
 			Workers: []openinspectv1alpha1.WorkerSpec{{
 				Name:   "control-plane",
-				Script: openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
+				Script: &openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "bundles", Key: "control-plane.js"}},
 			}},
 		}
 

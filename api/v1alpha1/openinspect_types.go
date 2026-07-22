@@ -69,9 +69,10 @@ type CloudflareSpec struct {
 // D1Spec describes the single D1 database and its schema migrations.
 type D1Spec struct {
 	// MigrationsConfigMapRef names a ConfigMap whose keys are numbered
-	// migration files (e.g. 0001_init.sql). They are applied in key order and
-	// tracked in a _schema_migrations table by numeric prefix, matching the
-	// upstream d1-migrate.sh semantics.
+	// migration files (e.g. 0001_init.sql), applied in key order and tracked
+	// in a _schema_migrations table by numeric prefix (upstream d1-migrate.sh
+	// semantics). Empty applies the release's embedded migrations from the
+	// pinned upstream revision; the ConfigMap is a development override.
 	// +optional
 	MigrationsConfigMapRef string `json:"migrationsConfigMapRef,omitempty"`
 }
@@ -166,7 +167,12 @@ type WorkerSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
 	Name string `json:"name"`
 
-	Script ScriptSource `json:"script"`
+	// Script overrides where the worker bundle comes from (development
+	// only). Empty uses the release's embedded bundle for this worker name
+	// (control-plane, github-bot, slack-bot, linear-bot), built from the
+	// pinned upstream revision.
+	// +optional
+	Script *ScriptSource `json:"script,omitempty"`
 
 	// +kubebuilder:default="2024-12-30"
 	// +optional

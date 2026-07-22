@@ -91,7 +91,7 @@ var _ = Describe("AppSecrets seeding", func() {
 				},
 				Workers: []openinspectv1alpha1.WorkerSpec{{
 					Name:   "control-plane",
-					Script: openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "as-bundles", Key: "cp.js"}},
+					Script: &openinspectv1alpha1.ScriptSource{ConfigMapRef: &openinspectv1alpha1.ConfigMapKeyRef{Name: "as-bundles", Key: "cp.js"}},
 					Secrets: []openinspectv1alpha1.WorkerSecret{{
 						Binding:   internalCallbackSecretBinding,
 						SecretRef: openinspectv1alpha1.SecretKeyRef{Name: "as-platform", Key: "ics"},

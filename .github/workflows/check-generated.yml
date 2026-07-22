@@ -39,3 +39,21 @@ jobs:
       # upstream source (EPIC1 D2) can never land silently.
       - name: Verify pinned upstream tree
         run: hack/sync-upstream.sh --verify
+
+  check-platform-bundles:
+    name: embedded bundles match pinned upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup Node
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v5.0.0
+        with:
+          node-version: "22"
+
+      # Rebuilds the worker bundles from the pinned tree and byte-compares
+      # them against internal/platformbundle: the embedded bundles can never
+      # drift from the pinned upstream revision.
+      - name: Verify embedded bundles
+        run: hack/build-bundles.sh --verify
