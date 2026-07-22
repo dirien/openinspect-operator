@@ -10,10 +10,12 @@ func TestHashModalSecretsFramingResistsAliasing(t *testing.T) {
 	if hashModalSecrets(a, "key") == hashModalSecrets(b, "key") {
 		t.Error("distinct secret sets hash identically: framing is aliasable")
 	}
-	if hashModalSecrets(a, "key") != hashModalSecrets(a, "key") {
+	first := hashModalSecrets(a, "key")
+	second := hashModalSecrets(a, "key")
+	if first != second {
 		t.Error("hash is not deterministic")
 	}
-	if hashModalSecrets(a, "key") == hashModalSecrets(a, "other-key") {
+	if first == hashModalSecrets(a, "other-key") {
 		t.Error("hash must be keyed")
 	}
 }
